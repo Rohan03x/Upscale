@@ -546,14 +546,35 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         except Exception as _int8e:
             print(f"  Upscale: INT8 skipped - {_int8e}", flush=True)
 
+        # channels_last (NHWC) layout: faster Conv2d on CUDA for the HAT stem/tail.
+        try:
+            upsampler.model = upsampler.model.to(memory_format=torch.channels_last)
+            print("  Upscale: channels_last memory format enabled", flush=True)
+        except Exception:
+            pass
+
+        # Inductor GEMM coordinate-descent tuning: profile GEMM kernel configs once,
+        # cache the winners — 5-15% on attention/MLP matmuls inside HAT.
+        # epilogue_fusion: fuse pointwise ops after GEMM into the same kernel.
+        try:
+            import torch._inductor.config as _ic
+            _ic.coordinate_descent_tuning = True
+            _ic.epilogue_fusion = True
+            _ic.coordinate_descent_search_radius = 2
+            print("  Upscale: inductor GEMM coordinate-descent tuning + epilogue fusion enabled",
+                  flush=True)
+        except Exception:
+            pass
+
         # torch.compile(reduce-overhead): CUDA graph capture (NOT Triton synthesis).
         # With tile inference, every tile call has the SAME fixed shape (_target×_target),
         # so the graph is captured once on warmup and replayed without Python dispatch
         # overhead (~hundreds of kernel launches → single cudaGraphLaunch).
         # reduce-overhead ≠ max-autotune: no Triton; compile = one warmup pass (~30-90 s).
-        # Flash SDPA explicitly enabled:
+        # Flash SDPA explicitly enabled; cuDNN SDPA uses native FA3 on Blackwell:
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(False)  # FA2 supersedes this
+        torch.backends.cuda.enable_cudnn_sdp(True)           # cuDNN FA3 on sm_120+ (Blackwell)
         try:
             _compiled_hat = torch.compile(
                 upsampler.model, mode='reduce-overhead', dynamic=False, fullgraph=False)
@@ -695,6 +716,25 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
             try:
                 if _compiled_hat is upsampler.model:
                     raise RuntimeError("pre-warm reverted to eager; skipping CUDA graph warmup")
+                # TILE_BATCH=3 probe: FP8 weights reduce per-tile VRAM vs the FP16-era
+                # 14 GB/tile empirical formula. The first call triggers Dynamo compilation
+                # for that batch shape; if OOM the graph is discarded, stay at batch=2.
+                if _TILE_BATCH == 2:
+                    try:
+                        _probe3 = torch.rand(3, 3, _target, _target,
+                                             device=upsampler.device, dtype=torch.float16)
+                        torch.compiler.cudagraph_mark_step_begin()
+                        with torch.no_grad():
+                            _compiled_hat(_probe3)
+                        del _probe3
+                        torch.cuda.empty_cache()
+                        _TILE_BATCH = 3
+                        _patch_tile_process(_compiled_hat)
+                        print("  Upscale: TILE_BATCH=3 probe succeeded — bumped from 2",
+                              flush=True)
+                    except (torch.cuda.OutOfMemoryError, RuntimeError):
+                        torch.cuda.empty_cache()
+                        print("  Upscale: TILE_BATCH=3 probe OOM — staying at 2", flush=True)
                 print(f"  Upscale: CUDA graph warmup ({_target}x{_target} × B={_TILE_BATCH})...",
                       flush=True)
                 _wup = torch.rand(_TILE_BATCH, 3, _target, _target,

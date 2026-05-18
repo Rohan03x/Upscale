@@ -138,7 +138,7 @@ def _build_venc_final(nvenc_ok: bool) -> list:
     if nvenc_ok:
         return ["-c:v", "hevc_nvenc", "-preset", "p7", "-tune", "hq",
                 "-rc", "constqp", "-qp", "20", "-b:v", "0"]
-    return ["-c:v", "libx265", "-preset", "medium", "-crf", "18",
+    return ["-c:v", "libx265", "-preset", "faster", "-crf", "18",
             "-x265-params", "log-level=error"]
 
 
