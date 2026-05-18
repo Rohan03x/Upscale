@@ -401,11 +401,14 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         ]
     elif args.model_name in ('Real_HAT_GAN_SRx4', 'Real_HAT_GAN_SRx4_sharper'):  # x4 HAT model
         try:
-            from basicsr.archs.hat_arch import HAT
+            # Use the local (patched) hat_arch — already registered at module import time
+            # via realesrgan.archs.__init__. Using basicsr.archs.hat_arch would trigger a
+            # second @ARCH_REGISTRY.register() call → AssertionError "HAT already registered".
+            from realesrgan.archs.hat_arch import HAT
         except ImportError:
             raise RuntimeError(
-                "HAT architecture not found in basicsr. "
-                "Install via: git clone https://github.com/XPixelGroup/HAT && cd HAT && pip install -r requirements.txt")
+                "HAT architecture not found. "
+                "Ensure realesrgan/archs/hat_arch.py is present and realesrgan is importable.")
         model = HAT(
             upscale=4, in_chans=3, img_size=64, window_size=16,
             compress_ratio=3, squeeze_factor=30, conv_scale=0.01,
