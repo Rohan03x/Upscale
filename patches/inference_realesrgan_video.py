@@ -546,13 +546,6 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         except Exception as _int8e:
             print(f"  Upscale: INT8 skipped - {_int8e}", flush=True)
 
-        # channels_last (NHWC) layout: faster Conv2d on CUDA for the HAT stem/tail.
-        try:
-            upsampler.model = upsampler.model.to(memory_format=torch.channels_last)
-            print("  Upscale: channels_last memory format enabled", flush=True)
-        except Exception:
-            pass
-
         # Inductor GEMM coordinate-descent tuning: profile GEMM kernel configs once,
         # cache the winners — 5-15% on attention/MLP matmuls inside HAT.
         # epilogue_fusion: fuse pointwise ops after GEMM into the same kernel.
