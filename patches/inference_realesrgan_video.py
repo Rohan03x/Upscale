@@ -255,6 +255,14 @@ class Reader:
     def close(self):
         if self.input_type.startswith('video'):
             self.stream_reader.stdin.close()
+            # Close stdout BEFORE wait() to prevent pipe-full deadlock:
+            # ffmpeg blocks writing to its stdout pipe when the buffer fills up
+            # (e.g. probe reader that never reads frames).  Closing the read end
+            # delivers SIGPIPE so ffmpeg exits and wait() returns immediately.
+            try:
+                self.stream_reader.stdout.close()
+            except Exception:
+                pass
             self.stream_reader.wait()
 
 
