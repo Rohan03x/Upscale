@@ -502,20 +502,18 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         except Exception as _int8e:
             print(f"  Upscale: INT8 skipped - {_int8e}", flush=True)
 
-        # torch.compile: cache_size_limit=64 required for HAT's 36 unique DropPath
-        # modules (default limit=8 caused dynamo cache thrash → 0.6x SLOWER).
-        # HAT uses "default" mode (not max-autotune) because:
-        #   - HAT is attention-heavy: GEMMs use cuBLAS via default mode = near-optimal
-        #   - max-autotune-no-cudagraphs spends 2-4 hrs on first-run AUTOTUNE for
-        #     HAT's ~200+ unique Triton kernel shapes (observed: 1 kernel/4 min)
-        #   - "default" compiles in ~3 min and gives ~90% of max-autotune throughput
-        # CDT is still useful for the few Conv2d layers in patch_embed/upsample.
-        torch._dynamo.config.cache_size_limit = 64
-        import torch._inductor.config as _ic
-        _ic.coordinate_descent_tuning = True
-        _compile_mode = 'default'
-        _compiled_hat = torch.compile(upsampler.model, mode=_compile_mode, dynamic=False)
-        print(f"  Upscale: torch.compile(mode='{_compile_mode}', CDT=True, dynamic=False)", flush=True)
+        # torch.compile intentionally SKIPPED for HAT:
+        # HAT uses F.scaled_dot_product_attention (FlashAttention 2 built-in via SDPA).
+        # SDPA already dispatches to optimally-fused FA2 kernels without compile.
+        # torch.compile("default") on HAT takes 6-10 min first-run for ~100 unique
+        # Triton kernels (diverse window/head/seq shapes in 36 HABs × RSTB), with
+        # <15% steady-state benefit vs pure FA2 eager on attention-dominant workloads.
+        # => run eager: instant startup, cuBLAS GEMM + FA2 SDPA = near-optimal.
+        # Flash SDPA explicitly enabled:
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)  # FA2 supersedes this
+        print("  Upscale: eager mode (no torch.compile) — SDPA/FA2 + FP8 + CUDA Graph", flush=True)
+        _compiled_hat = upsampler.model
 
         # PaddedTileModel: pads edge tiles to target dimensions (next multiple of
         # window_size=16 that fits tile+2*tile_pad).  For tile=384 + tile_pad=16:
