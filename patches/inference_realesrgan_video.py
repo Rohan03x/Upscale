@@ -512,18 +512,21 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         except Exception as _int8e:
             print(f"  Upscale: INT8 skipped - {_int8e}", flush=True)
 
-        # torch.compile intentionally SKIPPED for HAT:
-        # HAT uses F.scaled_dot_product_attention (FlashAttention 2 built-in via SDPA).
-        # SDPA already dispatches to optimally-fused FA2 kernels without compile.
-        # torch.compile("default") on HAT takes 6-10 min first-run for ~100 unique
-        # Triton kernels (diverse window/head/seq shapes in 36 HABs × RSTB), with
-        # <15% steady-state benefit vs pure FA2 eager on attention-dominant workloads.
-        # => run eager: instant startup, cuBLAS GEMM + FA2 SDPA = near-optimal.
+        # torch.compile(reduce-overhead): CUDA graph capture (NOT Triton synthesis).
+        # With tile inference, every tile call has the SAME fixed shape (_target×_target),
+        # so the graph is captured once on warmup and replayed without Python dispatch
+        # overhead (~hundreds of kernel launches → single cudaGraphLaunch).
+        # reduce-overhead ≠ max-autotune: no Triton; compile = one warmup pass (~30-90 s).
         # Flash SDPA explicitly enabled:
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(False)  # FA2 supersedes this
-        print("  Upscale: eager mode (no torch.compile) — SDPA/FA2 + FP8 + CUDA Graph", flush=True)
-        _compiled_hat = upsampler.model
+        try:
+            _compiled_hat = torch.compile(
+                upsampler.model, mode='reduce-overhead', dynamic=False, fullgraph=False)
+            print("  Upscale: torch.compile(reduce-overhead) — CUDA graphs + FP8", flush=True)
+        except Exception as _ce:
+            _compiled_hat = upsampler.model
+            print(f"  Upscale: torch.compile failed ({_ce}), using eager", flush=True)
 
         # PaddedTileModel: pads edge tiles to target dimensions (next multiple of
         # window_size=16 that fits tile+2*tile_pad).  For tile=384 + tile_pad=16:
@@ -561,31 +564,39 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                     tiles, placements = [], []
                     for y in range(tiles_y):
                         for x in range(tiles_x):
-                            isx = x * self.tile_size
-                            iex = min(isx + self.tile_size, width)
-                            isy = y * self.tile_size
-                            iey = min(isy + self.tile_size, height)
+                            # Core output region for this tile (placement target)
+                            osx_in = x * self.tile_size
+                            oex_in = min(osx_in + self.tile_size, width)
+                            osy_in = y * self.tile_size
+                            oey_in = min(osy_in + self.tile_size, height)
+                            # Slide back edge tiles to keep full tile_size input window:
+                            # tiny edge tiles (e.g. 64px wide) would need oversized reflect
+                            # padding (464px for 64→528) which PyTorch rejects; with
+                            # full-size window we always have ≤tile_pad px to reflect-pad.
+                            isx = osx_in if (oex_in - osx_in) == self.tile_size \
+                                else max(0, width - self.tile_size)
+                            iex = isx + min(self.tile_size, width)
+                            isy = osy_in if (oey_in - osy_in) == self.tile_size \
+                                else max(0, height - self.tile_size)
+                            iey = isy + min(self.tile_size, height)
                             isx_p = max(isx - self.tile_pad, 0)
                             iex_p = min(iex + self.tile_pad, width)
                             isy_p = max(isy - self.tile_pad, 0)
                             iey_p = min(iey + self.tile_pad, height)
-                            iw, ih = iex - isx, iey - isy
                             raw = self.img[:, :, isy_p:iey_p, isx_p:iex_p]
-                            # Pre-pad to target size (same contract as _PaddedTileModel)
                             h_r, w_r = raw.shape[-2], raw.shape[-1]
                             ph, pw = t_h - h_r, t_w - w_r
                             if ph > 0 or pw > 0:
-                                # reflect requires pad < dim; fall back to replicate for tiny tiles
                                 _pad_mode = 'reflect' if (ph < h_r and pw < w_r) else 'replicate'
                                 raw = _Ftb.pad(raw, (0, pw, 0, ph), _pad_mode)
                             tiles.append(raw)
                             placements.append((
-                                isy * tile_scale, iey * tile_scale,
-                                isx * tile_scale, iex * tile_scale,
-                                (isx - isx_p) * tile_scale,
-                                (isx - isx_p) * tile_scale + iw * tile_scale,
-                                (isy - isy_p) * tile_scale,
-                                (isy - isy_p) * tile_scale + ih * tile_scale,
+                                osy_in * tile_scale, oey_in * tile_scale,
+                                osx_in * tile_scale, oex_in * tile_scale,
+                                (osx_in - isx_p) * tile_scale,
+                                (oex_in - isx_p) * tile_scale,
+                                (osy_in - isy_p) * tile_scale,
+                                (oey_in - isy_p) * tile_scale,
                             ))
 
                     for start in range(0, len(tiles), tile_batch):
@@ -611,6 +622,26 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                 _make_batched_tile_process(
                     _TILE_BATCH, _compiled_hat, netscale, _target, _target),
                 upsampler)
+
+            # CUDA graph warmup: trigger compilation/capture before inference starts.
+            # Run 3 passes so CUDA graph is stably captured for both batch shapes.
+            print(f"  Upscale: CUDA graph warmup ({_target}x{_target} × B={_TILE_BATCH})...",
+                  flush=True)
+            _wup = torch.zeros(_TILE_BATCH, 3, _target, _target,
+                               device=device, dtype=torch.float16)
+            with torch.no_grad():
+                for _ in range(3):
+                    _compiled_hat(_wup)
+            if _TILE_BATCH > 1:
+                _wup1 = torch.zeros(1, 3, _target, _target,
+                                    device=device, dtype=torch.float16)
+                with torch.no_grad():
+                    for _ in range(3):
+                        _compiled_hat(_wup1)
+                del _wup1
+            torch.cuda.synchronize()
+            del _wup
+            print("  Upscale: warmup complete", flush=True)
         else:
             upsampler.model = _compiled_hat
 
