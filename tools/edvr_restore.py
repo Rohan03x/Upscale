@@ -93,9 +93,14 @@ def load_model(model_path: str) -> torch.nn.Module:
             _os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM", "0")
             print(f"  EDVR: autotune disabled ({_edvr_avail_gb:.0f} GB VRAM < 12 GB threshold)", flush=True)
         import torch._inductor.config as _ic
+        import torch._dynamo as _dynamo
         _ic.coordinate_descent_tuning = True
-        model = torch.compile(model, mode="max-autotune-no-cudagraphs", dynamic=False)
-        print("  EDVR: torch.compile(max-autotune-no-cudagraphs, CDT) enabled", flush=True)
+        # EDVR's DCNv2 has a data-dependent `if offset_absmean > 50:` branch that
+        # causes InternalTorchDynamoError in max-autotune/dynamic=False mode.
+        # Use "default" + dynamic=True so Dynamo handles the graph break gracefully.
+        _dynamo.config.suppress_errors = True
+        model = torch.compile(model, mode="default", dynamic=True)
+        print("  EDVR: torch.compile(default, CDT, suppress_errors) enabled", flush=True)
     except Exception as _ce:
         print(f"  EDVR: running in eager mode ({type(_ce).__name__})", flush=True)
     return model
