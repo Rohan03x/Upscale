@@ -194,10 +194,11 @@ def load_model(model_path: str) -> torch.nn.Module:
     return model
 
 
-# VRAM-adaptive batch: ~1 frame per GB is conservative (NAFNet-width32 peak ~400 MB/frame)
-# RTX 3070 8 GB → 8  |  RTX 4090 24 GB → 24  |  RTX 5090 32 GB → 32
+# VRAM-adaptive batch: max-autotune-no-cudagraphs pre-allocates ALL intermediate
+# buffers simultaneously (~0.87 GB/frame at 1920×1080 FP16 on RTX 5090 empirical).
+# Use _vram_gb/4 cap at 8 to leave headroom: RTX 3070 8 GB → 2 | RTX 5090 32 GB → 8
 _vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
-NAFNET_BATCH = min(64, max(8, int(_vram_gb)))
+NAFNET_BATCH = min(8, max(2, int(_vram_gb / 4)))
 
 
 @torch.no_grad()
@@ -292,6 +293,10 @@ def probe_video(ffmpeg_bin: str, video_path: str):
 
 
 def main() -> None:
+    import os
+    # Reduce allocator fragmentation; helps when compiled fused kernels need large contiguous blocks
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     ap = argparse.ArgumentParser(description="NAFNet blind deblur for video")
     ap.add_argument("--input",  required=True,  help="Input video path")
     ap.add_argument("--output", required=True,  help="Output video path")
