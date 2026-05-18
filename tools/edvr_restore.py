@@ -92,8 +92,10 @@ def load_model(model_path: str) -> torch.nn.Module:
             _os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "0")
             _os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM", "0")
             print(f"  EDVR: autotune disabled ({_edvr_avail_gb:.0f} GB VRAM < 12 GB threshold)", flush=True)
-        model = torch.compile(model, mode="default", dynamic=False)
-        print("  EDVR: torch.compile(default) enabled", flush=True)
+        import torch._inductor.config as _ic
+        _ic.coordinate_descent_tuning = True
+        model = torch.compile(model, mode="max-autotune-no-cudagraphs", dynamic=False)
+        print("  EDVR: torch.compile(max-autotune-no-cudagraphs, CDT) enabled", flush=True)
     except Exception as _ce:
         print(f"  EDVR: running in eager mode ({type(_ce).__name__})", flush=True)
     return model

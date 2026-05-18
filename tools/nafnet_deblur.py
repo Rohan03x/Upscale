@@ -185,8 +185,10 @@ def load_model(model_path: str) -> torch.nn.Module:
     # dynamic=False: fixes tensor shapes so Inductor specialises kernels for this resolution.
     try:
         import triton as _triton  # noqa
-        model = torch.compile(model, mode="default", dynamic=False)
-        print("  NAFNet: torch.compile(default) enabled", flush=True)
+        import torch._inductor.config as _ic
+        _ic.coordinate_descent_tuning = True
+        model = torch.compile(model, mode="max-autotune-no-cudagraphs", dynamic=False)
+        print("  NAFNet: torch.compile(max-autotune-no-cudagraphs, CDT) enabled", flush=True)
     except Exception as _ce:
         print(f"  NAFNet: running in eager mode ({type(_ce).__name__})", flush=True)
     return model
