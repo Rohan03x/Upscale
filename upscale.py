@@ -111,6 +111,43 @@ COLOUR_CORRECT = "eq=contrast=1.08:brightness=0.01:saturation=1.15:gamma=0.95"
 SHARPEN_CAS = "cas=strength=0.4"
 
 
+# -- NVENC capability check --------------------------------------------------
+def _probe_nvenc(ffmpeg_bin) -> bool:
+    """Return True if hevc_nvenc works on this system (driver + SDK version match)."""
+    try:
+        r = subprocess.run(
+            [str(ffmpeg_bin), "-f", "lavfi", "-i", "testsrc=size=64x64:rate=1",
+             "-vframes", "1", "-c:v", "hevc_nvenc", "-preset", "lossless",
+             "-f", "null", "-"],
+            capture_output=True, timeout=15)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _build_venc_lossless(nvenc_ok: bool) -> list:
+    """Return ffmpeg codec args for lossless intermediate files."""
+    if nvenc_ok:
+        return ["-c:v", "hevc_nvenc", "-preset", "lossless"]
+    # libx264 lossless: -qp 0 with ultrafast — typically 200-400fps at 1080p on modern CPU
+    return ["-c:v", "libx264", "-preset", "ultrafast", "-qp", "0"]
+
+
+def _build_venc_final(nvenc_ok: bool) -> list:
+    """Return ffmpeg codec args for the final high-quality output."""
+    if nvenc_ok:
+        return ["-c:v", "hevc_nvenc", "-preset", "p7", "-tune", "hq",
+                "-rc", "constqp", "-qp", "20", "-b:v", "0"]
+    return ["-c:v", "libx265", "-preset", "slow", "-crf", "18",
+            "-x265-params", "log-level=error"]
+
+
+# Probe once at startup — fast (< 1s); result used everywhere hevc_nvenc is needed
+_NVENC_OK = _probe_nvenc(FFMPEG_BIN)
+_VENC_LOSSLESS = _build_venc_lossless(_NVENC_OK)
+_VENC_FINAL    = _build_venc_final(_NVENC_OK)
+
+
 # -- Helpers -----------------------------------------------------------------
 _stage_start = None
 
@@ -197,7 +234,7 @@ def stage_denoise(src, dst, denoise_level, dur_s=0, deinterlace=False):
     run([
         FFMPEG, "-threads", "0", "-hwaccel", "cuda", "-y", "-i", src,
         "-vf", vf,
-        "-c:v", "hevc_nvenc", "-preset", "lossless",  # GPU lossless — instant vs CPU x264
+        *_VENC_LOSSLESS,
         "-c:a", "copy", dst
     ], f"Stage 1  Deblock + Denoise ({denoise_level})", eta_hint=eta)
 
@@ -228,7 +265,7 @@ def stage_stabilize(src, dst, work_dir):
             f"smoothing=15:optzoom=1:zoom=0:interpol=bicubic,"
             f"unsharp=5:5:0.3:3:3:0.0"
         ),
-        "-c:v", "hevc_nvenc", "-preset", "lossless",
+        *_VENC_LOSSLESS,
         "-c:a", "copy", dst
     ], "Stage 2  Stabilize: Pass 2 (apply)", eta_hint="~8 min", cwd=work_dir)
 
@@ -573,7 +610,7 @@ def stage_post(src, dst):
     run([
         FFMPEG, "-threads", "0", "-hwaccel", "cuda", "-y", "-i", src,
         "-vf", vf,
-        "-c:v", "hevc_nvenc", "-preset", "lossless",
+        *_VENC_LOSSLESS,
         "-c:a", "copy", dst
     ], "Stage 5  CAS Sharpen + Colour Correct", eta_hint="~15 min")
 
@@ -658,7 +695,7 @@ def stage_grain(src, dst, dur_s=0):
     run([
         FFMPEG, "-threads", "0", "-hwaccel", "cuda", "-y", "-i", src,
         "-vf", "noise=c0s=8:c0f=t:c1s=3:c1f=t:c2s=3:c2f=t",
-        "-c:v", "hevc_nvenc", "-preset", "lossless",
+        *_VENC_LOSSLESS,
         "-c:a", "copy", dst
     ], "Stage 6.5  Synthetic grain add-back (luma=8, chroma=3, temporal)", eta_hint=eta)
 
@@ -780,15 +817,20 @@ def stage_encode(video_src, audio_src, dst, codec="hevc"):
         ]
         label = "Final Encode  AV1 NVENC GPU  CQ28"
     else:
-        vc_args = [
-            "-c:v", "hevc_nvenc", "-preset", "p7", "-tune", "hq",
-            "-rc", "vbr", "-cq", "14", "-b:v", "0",
-            "-maxrate", "120M", "-multipass", "fullres",
-            "-rc-lookahead", "32",            # GPU temporal lookahead — all 3 NVENC engines on RTX 5090
-            "-spatial-aq", "1", "-aq-strength", "8", "-temporal-aq", "1",
-            "-tag:v", "hvc1",
-        ]
-        label = "Final Encode  HEVC NVENC GPU  CQ14"
+        if _NVENC_OK:
+            vc_args = [
+                "-c:v", "hevc_nvenc", "-preset", "p7", "-tune", "hq",
+                "-rc", "vbr", "-cq", "14", "-b:v", "0",
+                "-maxrate", "120M", "-multipass", "fullres",
+                "-rc-lookahead", "32",
+                "-spatial-aq", "1", "-aq-strength", "8", "-temporal-aq", "1",
+                "-tag:v", "hvc1",
+            ]
+            label = "Final Encode  HEVC NVENC GPU  CQ14"
+        else:
+            vc_args = ["-c:v", "libx265", "-preset", "slow", "-crf", "18",
+                       "-x265-params", "log-level=error"]
+            label = "Final Encode  HEVC x265 software  CRF18"
     run([
         FFMPEG, "-y",
         "-i", video_src,
@@ -960,7 +1002,7 @@ def main():
         print(f"  MODEL      : {args.model}" + (f"  (dn={args.dn})" if args.model == "realesr-general-x4v3" else ""))
     print(f"  FACE RESTORE: {'yes (fidelity=' + str(args.face_fidelity) + ')' if args.face_restore else 'no'}")
     print(f"  RIFE       : {'Python/CUDA' if has_rife_py else 'ncnn/Vulkan' if has_rife_exe else 'NOT AVAILABLE'}  (exp={args.rife_exp}, uhd={args.rife_uhd})")
-    print(f"  CODEC      : {'AV1 NVENC CQ28' if args.codec == 'av1' else 'HEVC NVENC CQ14'}")
+    print(f"  CODEC      : {'AV1 NVENC CQ28' if args.codec == 'av1' else ('HEVC NVENC CQ14' if _NVENC_OK else 'HEVC x265 CRF18 (software — NVENC unavailable)')}")
     print(f"  OUTPUT     : {out}")
     print(f"{'-'*62}")
     print(f"  ESTIMATED PIPELINE TIME:")
