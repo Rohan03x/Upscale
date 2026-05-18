@@ -617,31 +617,41 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
 
                 return _tile_process
 
-            # Monkey-patch RealESRGANer instance with the batched tile_process
-            upsampler.tile_process = _types_tb.MethodType(
-                _make_batched_tile_process(
-                    _TILE_BATCH, _compiled_hat, netscale, _target, _target),
-                upsampler)
+            def _patch_tile_process(inner):
+                upsampler.tile_process = _types_tb.MethodType(
+                    _make_batched_tile_process(
+                        _TILE_BATCH, inner, netscale, _target, _target),
+                    upsampler)
+
+            _patch_tile_process(_compiled_hat)
 
             # CUDA graph warmup: trigger compilation/capture before inference starts.
-            # Run 3 passes so CUDA graph is stably captured for both batch shapes.
-            print(f"  Upscale: CUDA graph warmup ({_target}x{_target} × B={_TILE_BATCH})...",
-                  flush=True)
-            _wup = torch.zeros(_TILE_BATCH, 3, _target, _target,
-                               device=device, dtype=torch.float16)
-            with torch.no_grad():
-                for _ in range(3):
-                    _compiled_hat(_wup)
-            if _TILE_BATCH > 1:
-                _wup1 = torch.zeros(1, 3, _target, _target,
-                                    device=device, dtype=torch.float16)
+            # NOTE: dynamic-activation FP8 (Float8DynamicActivationFloat8WeightConfig)
+            # computes per-tensor max(|activation|) at runtime — this data-dependent op
+            # breaks CUDA graph capture.  Catch the failure and revert to eager FP8.
+            try:
+                print(f"  Upscale: CUDA graph warmup ({_target}x{_target} × B={_TILE_BATCH})...",
+                      flush=True)
+                _wup = torch.rand(_TILE_BATCH, 3, _target, _target,
+                                  device=device, dtype=torch.float16)
                 with torch.no_grad():
                     for _ in range(3):
-                        _compiled_hat(_wup1)
-                del _wup1
-            torch.cuda.synchronize()
-            del _wup
-            print("  Upscale: warmup complete", flush=True)
+                        _compiled_hat(_wup)
+                if _TILE_BATCH > 1:
+                    _wup1 = torch.rand(1, 3, _target, _target,
+                                       device=device, dtype=torch.float16)
+                    with torch.no_grad():
+                        for _ in range(3):
+                            _compiled_hat(_wup1)
+                    del _wup1
+                torch.cuda.synchronize()
+                del _wup
+                print("  Upscale: warmup complete — CUDA graphs active", flush=True)
+            except Exception as _we:
+                print(f"  Upscale: compile/warmup failed ({type(_we).__name__}: {_we}); "
+                      f"reverting to eager FP8", flush=True)
+                _compiled_hat = upsampler.model   # back to uncompiled FP8 model
+                _patch_tile_process(_compiled_hat)  # re-patch closure with eager model
         else:
             upsampler.model = _compiled_hat
 
