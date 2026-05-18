@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bench_trt.sh — torch_tensorrt backend, FP16 TRT engine build
-# Requires: pip install torch-tensorrt tensorrt (done via trt_install screen)
-set -euo pipefail
+# torch-tensorrt 2.8.0+cu128 + tensorrt 10.12.0.36 installed on pod
+# Does NOT use set -euo pipefail — TRT may fail certain HAT subgraphs; we want the log, not an abort
 LOG=/root/Upscale/output/bench_trt.log
 exec > >(tee "$LOG") 2>&1
 echo "=== bench_trt: tensorrt backend (FP16) ==="
