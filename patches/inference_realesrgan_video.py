@@ -120,16 +120,19 @@ except ImportError:
 _NVENC_AVAILABLE = None
 
 def _probe_nvenc(ffmpeg_bin: str) -> bool:
-    """Return True if hevc_nvenc encoder is present in the FFmpeg binary."""
+    """Return True if hevc_nvenc can *actually* encode (functional test, not just listed).
+    Containers can list hevc_nvenc in --encoders but block it at driver level, causing
+    a runtime crash.  We run a 1-frame null encode to confirm it works before using it."""
     global _NVENC_AVAILABLE
     if _NVENC_AVAILABLE is not None:
         return _NVENC_AVAILABLE
     try:
         r = subprocess.run(
-            [ffmpeg_bin, "-hide_banner", "-encoders"],
-            capture_output=True, text=True, timeout=10,
+            [ffmpeg_bin, "-hide_banner", "-f", "lavfi", "-i", "color=black:s=64x64:r=1:d=1",
+             "-vframes", "1", "-c:v", "hevc_nvenc", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=15,
         )
-        _NVENC_AVAILABLE = "hevc_nvenc" in r.stdout
+        _NVENC_AVAILABLE = (r.returncode == 0)
     except Exception:
         _NVENC_AVAILABLE = False
     tag = "hevc_nvenc (NVENC H.265)" if _NVENC_AVAILABLE else "libx264 (CPU H.264)"
