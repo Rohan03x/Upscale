@@ -670,20 +670,31 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
             # The compiled graph then traces the "cache hit" branch: reads _mask_cache
             # as a module constant rather than writing it as a graph output buffer.
             # This prevents "tensor output overwritten by subsequent run" on replay.
-            print(f"  Upscale: pre-warming mask cache ({_target}×{_target})...", flush=True)
-            with torch.no_grad():
-                _mwup = torch.rand(1, 3, _target, _target, device=upsampler.device, dtype=torch.float16)
-                _orig_hat(_mwup)  # run ORIGINAL (uncompiled) model to set _mask_cache
-                del _mwup
-            del _orig_hat
-            torch.cuda.empty_cache()
-            print("  Upscale: mask cache ready", flush=True)
+            try:
+                print(f"  Upscale: pre-warming mask cache ({_target}×{_target})...", flush=True)
+                with torch.no_grad():
+                    _mwup = torch.rand(1, 3, _target, _target, device=upsampler.device, dtype=torch.float16)
+                    _orig_hat(_mwup)  # run ORIGINAL (uncompiled) model to set _mask_cache
+                    del _mwup
+                del _orig_hat
+                torch.cuda.empty_cache()
+                print("  Upscale: mask cache ready", flush=True)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as _pe:
+                print(f"  Upscale: mask pre-warm OOM ({type(_pe).__name__}); "
+                      f"reverting to eager FP8", flush=True)
+                _compiled_hat = upsampler.model
+                _patch_tile_process(_compiled_hat)
+                if '_orig_hat' in dir():
+                    del _orig_hat
+                torch.cuda.empty_cache()
 
             # CUDA graph warmup: trigger compilation/capture before inference starts.
             # NOTE: dynamic-activation FP8 (Float8DynamicActivationFloat8WeightConfig)
             # computes per-tensor max(|activation|) at runtime — this data-dependent op
             # breaks CUDA graph capture.  Catch the failure and revert to eager FP8.
             try:
+                if _compiled_hat is upsampler.model:
+                    raise RuntimeError("pre-warm reverted to eager; skipping CUDA graph warmup")
                 print(f"  Upscale: CUDA graph warmup ({_target}x{_target} × B={_TILE_BATCH})...",
                       flush=True)
                 _wup = torch.rand(_TILE_BATCH, 3, _target, _target,
