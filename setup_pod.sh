@@ -22,7 +22,8 @@ echo "================================================================"
 echo ""
 echo "[1/7] System packages..."
 apt-get update -qq
-apt-get install -y -q ffmpeg screen libvid-stab-dev git wget 2>&1 | tail -5
+apt-get install -y -q ffmpeg screen git wget 2>&1 | tail -5
+apt-get install -y -q libvid-stab-dev 2>/dev/null || true  # not in Ubuntu 22.04 minimal; ffmpeg already has vidstab
 
 # ── 2. Python packages ────────────────────────────────────────────────────────
 echo ""
@@ -30,7 +31,7 @@ echo "[2/7] Python packages..."
 pip install -q \
   basicsr realesrgan facexlib gfpgan \
   einops \
-  skvideo moviepy \
+  scikit-video moviepy \
   ffmpeg-python imageio imageio-ffmpeg \
   opencv-python-headless \
   Pillow numpy scipy scikit-image tqdm \
@@ -134,26 +135,21 @@ else
   echo "  EDVR-deblur.pth already exists"
 fi
 
-# RIFE v4.6 model (train_log/ — Practical-RIFE release)
+# RIFE v4.25 model (train_log/ — Google Drive via gdown)
 RIFE_LOG=$TOOLS/RIFE/train_log
 if [ ! -f "$RIFE_LOG/RIFE_HDv3.py" ]; then
-  echo "  Downloading RIFE v4.6 model weights..."
+  echo "  Downloading RIFE v4.25 model weights (Google Drive)..."
   mkdir -p $RIFE_LOG
-  # Try HuggingFace RIFE weights
-  python3 -c "
-from huggingface_hub import snapshot_download
-import shutil, os
-local = snapshot_download(repo_id='hzwer/RIFE', ignore_patterns=['*.md','*.txt'])
-for f in os.listdir(local):
-    shutil.copy2(os.path.join(local, f), '$RIFE_LOG/' + f)
-print('  RIFE weights downloaded via HuggingFace')
-" || {
-    # Fallback: direct release download
-    wget -q -O /tmp/rife_model.zip \
-      "https://github.com/hzwer/Practical-RIFE/releases/download/model-v4.6/train_log.zip" \
-      && unzip -q /tmp/rife_model.zip -d $TOOLS/RIFE/ && rm /tmp/rife_model.zip \
-      || echo "  WARNING: RIFE weights download failed — try manually"
-  }
+  python3 -m gdown 1ZKjcbmt1hypiFprJPIKW0Tt0lr_2i7bg -O /tmp/rife_v425.zip \
+    && unzip -o /tmp/rife_v425.zip -d /tmp/rife_v425/ \
+    && cp /tmp/rife_v425/train_log/RIFE_HDv3.py \
+          /tmp/rife_v425/train_log/IFNet_HDv3.py \
+          /tmp/rife_v425/train_log/refine.py \
+          /tmp/rife_v425/train_log/flownet.pkl \
+          $RIFE_LOG/ \
+    && rm -rf /tmp/rife_v425/ /tmp/rife_v425.zip \
+    && echo "  RIFE v4.25 model installed" \
+    || echo "  WARNING: RIFE weights download failed — install manually"
 else
   echo "  RIFE train_log already exists"
 fi
@@ -162,8 +158,15 @@ fi
 echo ""
 echo "[5/7] Applying patches..."
 
+# Fix basicsr torchvision compatibility (functional_tensor removed in torchvision>=0.17)
+BDIR=$(pip3 show basicsr | grep Location | awk '{print $2}')/basicsr
+if grep -q 'functional_tensor' $BDIR/data/degradations.py 2>/dev/null; then
+  sed -i 's/from torchvision.transforms.functional_tensor import rgb_to_grayscale/from torchvision.transforms.functional import rgb_to_grayscale/' \
+    $BDIR/data/degradations.py
+  echo "  Applied torchvision functional_tensor fix"
+fi
+
 # hat_arch.py → basicsr installed package
-BDIR=$(python3 -c "import basicsr,os; print(os.path.dirname(basicsr.__file__))")
 echo "  basicsr at: $BDIR"
 cp $REPO/patches/hat_arch.py $BDIR/archs/hat_arch.py
 echo "  Patched: $BDIR/archs/hat_arch.py"
