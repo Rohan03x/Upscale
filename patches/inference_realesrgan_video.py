@@ -533,6 +533,80 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
             _target = ((args.tile + 2 * args.tile_pad + _win - 1) // _win) * _win
             upsampler.model = _PaddedTileModel(_compiled_hat, _target, _target, scale=netscale)
             print(f"  Upscale: _PaddedTileModel target={_target}x{_target} (all tiles uniform)", flush=True)
+
+            # --- Tile batching: process N tiles per forward pass ---
+            # _PaddedTileModel ensures all tiles pad to _target×_target, so a batch of
+            # N tiles gives an [N, C, _target, _target] tensor → single model call.
+            # VRAM budget: empirical ~12-13 GB/tile on RTX 5090 (31 GB) at tile=512.
+            # Formula: max(1, int(_uvram / 14)) → 2 tiles on ≥28 GB, 1 tile on <14 GB.
+            _TILE_BATCH = max(1, int(_uvram / 14))
+            print(f"  Upscale: TILE_BATCH={_TILE_BATCH} "
+                  f"(tile batching: {_TILE_BATCH} tiles per forward pass)", flush=True)
+
+            import types as _types_tb, math as _math_tb
+
+            def _make_batched_tile_process(tile_batch, inner_model, tile_scale, t_h, t_w):
+                """Return a tile_process method that batches up to tile_batch tiles."""
+                from torch.nn import functional as _Ftb
+
+                def _tile_process(self):
+                    bat, ch, height, width = self.img.shape
+                    self.output = self.img.new_zeros(
+                        (bat, ch, height * tile_scale, width * tile_scale))
+                    tiles_x = _math_tb.ceil(width  / self.tile_size)
+                    tiles_y = _math_tb.ceil(height / self.tile_size)
+
+                    tiles, placements = [], []
+                    for y in range(tiles_y):
+                        for x in range(tiles_x):
+                            isx = x * self.tile_size
+                            iex = min(isx + self.tile_size, width)
+                            isy = y * self.tile_size
+                            iey = min(isy + self.tile_size, height)
+                            isx_p = max(isx - self.tile_pad, 0)
+                            iex_p = min(iex + self.tile_pad, width)
+                            isy_p = max(isy - self.tile_pad, 0)
+                            iey_p = min(iey + self.tile_pad, height)
+                            iw, ih = iex - isx, iey - isy
+                            raw = self.img[:, :, isy_p:iey_p, isx_p:iex_p]
+                            # Pre-pad to target size (same contract as _PaddedTileModel)
+                            h_r, w_r = raw.shape[-2], raw.shape[-1]
+                            ph, pw = t_h - h_r, t_w - w_r
+                            if ph > 0 or pw > 0:
+                                raw = _Ftb.pad(raw, (0, pw, 0, ph), 'reflect')
+                            tiles.append(raw)
+                            placements.append((
+                                isy * tile_scale, iey * tile_scale,
+                                isx * tile_scale, iex * tile_scale,
+                                (isx - isx_p) * tile_scale,
+                                (isx - isx_p) * tile_scale + iw * tile_scale,
+                                (isy - isy_p) * tile_scale,
+                                (isy - isy_p) * tile_scale + ih * tile_scale,
+                            ))
+
+                    for start in range(0, len(tiles), tile_batch):
+                        chunk = tiles[start:start + tile_batch]
+                        places = placements[start:start + tile_batch]
+                        inp = torch.cat(chunk, dim=0)  # [N, C, t_h, t_w]
+                        try:
+                            with torch.no_grad():
+                                outs = inner_model(inp)  # [N, C, t_h*scale, t_w*scale]
+                        except RuntimeError as _e:
+                            print(f'  Tile batch OOM (N={len(chunk)}): {_e}; '
+                                  f'falling back to N=1', flush=True)
+                            outs = torch.cat(
+                                [inner_model(t) for t in chunk], dim=0)
+                        for j, (osy, oey, osx, oex, ostx, oetx, osty, oety) in enumerate(places):
+                            self.output[:, :, osy:oey, osx:oex] = \
+                                outs[j:j+1, :, osty:oety, ostx:oetx]
+
+                return _tile_process
+
+            # Monkey-patch RealESRGANer instance with the batched tile_process
+            upsampler.tile_process = _types_tb.MethodType(
+                _make_batched_tile_process(
+                    _TILE_BATCH, _compiled_hat, netscale, _target, _target),
+                upsampler)
         else:
             upsampler.model = _compiled_hat
 
