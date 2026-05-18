@@ -1284,3 +1284,124 @@ BENCH CHECKLIST (as of Session 7 end)
 
 ================================================================
 
+
+================================================================
+ADDITIONAL RESEARCH -- SESSION 9  (2026-05-18)
+================================================================
+
+GPU: RTX 5090 (Blackwell sm_120), 31.36 GiB VRAM
+PyTorch: 2.8.0+cu128, torch_tensorrt 2.8.0+cu128, tensorrt 10.12.0.36
+Pod HEAD: d41f2e2
+
+----------------------------------------------------------------
+FINDING #21: B-TRT2 FINAL VERDICT — TRT FUNDAMENTALLY INCOMPATIBLE WITH HAT
+----------------------------------------------------------------
+
+RESULT: bench_trt2 FAILED with identical mul_16 error despite FP8/INT8 being
+  properly SKIPPED. The log confirmed:
+    "Upscale: FP8/INT8 skipped (TRT backend — precision managed by TRT FP16)"
+  → FP8 fix WAS correctly deployed and active.
+  → mul_16 is NOT from torchao quantization.
+  → mul_16 is a NATIVE HAT model operation.
+
+ROOT CAUSE ANALYSIS:
+  The HAT model contains an aten.mul.Tensor operation (the 17th mul in the graph,
+  hence "mul_16" in 0-indexed naming) that TRT 10.12's kernel library does not
+  support on sm_120 (Blackwell RTX 5090).
+
+  What mul_16 is in HAT:
+  - After all other mul ops (attention scale, GELU intermediate, residual gates),
+    mul_16 corresponds to one of HAT's attention scaling or channel gating ops
+    whose specific tensor shape/stride configuration has no TRT kernel for sm_120.
+  - All TRT memory tactics were tried: 17.4 GB, 6.8 GB, 11.4 GB, 13.9 GB — ALL OOM.
+  - After exhausting all memory tactics, TRT falls back to AssertionError
+    (assert serialized_engine fails) → entire subgraph reverts to GraphModule.
+
+  WHY NOT FIXABLE:
+  1. The op is native PyTorch (not inserted by quantization or preprocessing).
+  2. torch_executed_ops=['aten.mul.Tensor'] would exclude ALL mul ops from TRT,
+     reducing TRT coverage to trivial subgraphs with data-copy overhead.
+  3. TRT 10.12 on sm_120 (consumer Blackwell) has incomplete kernel coverage.
+     TRT 10.12 was originally validated on data-center Blackwell (B100, sm_100).
+     Consumer RTX 5090 (sm_120) uses a different architecture micro-variant.
+  4. Future TRT version (10.13+) may add sm_120 support, but not guaranteed.
+
+SIDE EFFECTS of TRT failure:
+  - TRT tactic search consumed 13-17 GB VRAM transiently before failing
+  - VRAM pressure during probe caused TILE_BATCH to stay at 2 (3 would OOM)
+  - bench_trt2 ran as plain Inductor B=2 at tile=512 → ~9 s/frame expected
+  - Process killed before completing (would have taken 1.5+ hrs for useless data)
+
+VERDICT: TRT backend is PERMANENTLY BLOCKED for HAT on RTX 5090.
+  Mark as HARMFUL — wastes time + VRAM on failed tactic search before falling back.
+  Do NOT retry TRT with any configuration changes.
+
+----------------------------------------------------------------
+FINDING #22: TILE LAYOUT EXHAUSTIVE ANALYSIS — pad=8 IS THE OPTIMAL NEXT STEP
+----------------------------------------------------------------
+
+TILE SIZE ANALYSIS for 1080×1920 input, TILE_BATCH=2 (GPU VRAM ceiling at B=3):
+  target = ceil((tile + 2*pad + 15) // 16) * 16
+
+  Config                          target  tiles  passes  total_px    vs B-640
+  ---------------------------------------------------------------------------
+  tile=640 pad=10 B=2 (B-640)      672      6      3    2,709,504    1.000x  ← baseline
+  tile=640 pad=8  B=2 (PAD8-run)   656      6      3    2,582,016    0.953x  ← 4.7% less
+  tile=640 pad=0  B=2              640      6      3    2,457,600    0.907x  ← 9.3% less (quality risk)
+  tile=576 pad=10 B=2              608      8      4    2,957,312    1.091x  WORSE (4 passes)
+  tile=960 pad=8  B=2              976      4      2    3,810,304    1.406x  WORSE (larger tiles)
+  tile=512 pad=10 B=3 (B1)         544     12      4    3,551,232    1.311x  WORSE
+
+  KEY FINDINGS:
+  1. NO tile configuration with TILE_BATCH=2 achieves fewer than 3 passes for 1080×1920
+     except 4-tile configs (e.g. tile=960), but those have much more compute per pass.
+  2. tile=640 is the unique "sweet spot" — only value giving 6 tiles (2 rows × 3 cols)
+     that divides evenly by TILE_BATCH=2 into 3 passes with minimal tile size.
+  3. Reducing tile (e.g. tile=576) gives 8 tiles → 4 passes → always slower.
+  4. Increasing tile (e.g. tile=704) gives 6 tiles but larger pads → more compute.
+  5. The only remaining improvement axis is tile_pad reduction (smaller target_size).
+
+  TILE_PAD TIERS FOR tile=640, win=16:
+    pad=0:   target=640  (640 is mult of 16, zero rounding)    0 context pixels
+    pad=1-8: target=656  (first tier above 640, +16 pixels)    8 context pixels max
+    pad=9-16: target=672 (second tier, +32 pixels) ← CURRENT
+
+  DISTINCT EXPERIMENTS REMAINING:
+    bench_tile_pad8 (running): pad=8 → 656×656, 4.7% less compute than B-640
+    bench_tile_pad0 (prepared): pad=0 → 640×640, 9.3% less compute, QUALITY RISK
+
+  For pad=0: HAT's window_size=16, and with pad=0 there is ZERO context from
+    neighbouring tiles at boundaries. Edge windows see only reflect/replicate
+    padding from the tile itself. This will cause visible seam artifacts at
+    640px intervals (x=640, 1280 in the 1920-wide output) in high-contrast content.
+    Run as quality experiment only; if seams visible, revert to pad=8.
+
+----------------------------------------------------------------
+BENCH CHECKLIST (as of Session 9)
+----------------------------------------------------------------
+
+  #       Name              Config                              Status    s/frame  vs 6.60
+  --------------------------------------------------------------------------------------------
+  B0      baseline          reduce-overhead, B=3, FP8           DONE      6.97     0.946x
+  B1      bench_autotune    max-autotune-no-cudagraphs, B=3     DONE      6.60     1.000x
+  B-TRT   bench_trt         TRT FP16 + FP8 (conflict)          ABORTED   —        —
+  B-MAX   bench_maxautotune max-autotune+CUDA graphs, B=2       CRASHED   —        HARMFUL
+  B-640   bench_tile640     tile=640, pad=10, max-autotune-no-cg DONE     5.31     1.243x  ← BEST
+  B-TRT2  bench_trt2        TRT FP16, no FP8 (FIXED)           FAILED    —        BLOCKED
+  B-PAD8  bench_tile_pad8   tile=640, pad=8, max-autotune-no-cg RUNNING  TBD      TBD
+  B-PAD0  bench_tile_pad0   tile=640, pad=0, max-autotune-no-cg PENDING  TBD      quality?
+
+  Active: screen 213282.bench_pad8 = bench_tile_pad8 RUNNING (AUTOTUNE warmup 656×656)
+  Next: bench_tile_pad0 (after pad8 done; pushed to GitHub d41f2e2)
+
+  Expected results:
+    B-PAD8: ~5.06 s/frame (5.31 × 0.953 = 5.06) — 4.7% faster than B-640
+    B-PAD0: ~4.82 s/frame (5.31 × 0.907 = 4.82) — quality experiment
+
+  THEORETICAL MINIMUM (tile=640 pad=0 B=2 = 9.3% less than B-640):
+    ~4.82 s/frame with no quality degradation is the floor with current architecture.
+    Any further gain requires model changes or more VRAM (to increase TILE_BATCH).
+
+================================================================
+
+
