@@ -520,21 +520,6 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         # Flash SDPA explicitly enabled:
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(False)  # FA2 supersedes this
-
-        # Pre-compute HAT's _mask_cache on the UNCOMPILED model so torch.compile sees
-        # the cache as already populated.  This forces the compiled graph to take the
-        # "cache hit" branch (read _mask_cache as a module constant), never the
-        # "cache miss" branch (write to _mask_cache as a graph output buffer).
-        # Without this, reduce-overhead replays overwrite the CUDA-graph-managed buffer
-        # that _mask_cache points to → "tensor output overwritten by subsequent run".
-        print(f"  Upscale: pre-warming mask cache ({_target}×{_target})...", flush=True)
-        with torch.no_grad():
-            _mwup = torch.rand(1, 3, _target, _target, device=device, dtype=torch.float16)
-            upsampler.model(_mwup)
-            del _mwup
-        torch.cuda.empty_cache()
-        print("  Upscale: mask cache ready — compiling with reduce-overhead...", flush=True)
-
         try:
             _compiled_hat = torch.compile(
                 upsampler.model, mode='reduce-overhead', dynamic=False, fullgraph=False)
@@ -551,6 +536,7 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         if args.tile > 0:
             _win    = 16   # HAT window_size
             _target = ((args.tile + 2 * args.tile_pad + _win - 1) // _win) * _win
+            _orig_hat = upsampler.model  # original uncompiled model — needed for mask pre-warm
             upsampler.model = _PaddedTileModel(_compiled_hat, _target, _target, scale=netscale)
             print(f"  Upscale: _PaddedTileModel target={_target}x{_target} (all tiles uniform)", flush=True)
 
@@ -643,6 +629,21 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                     upsampler)
 
             _patch_tile_process(_compiled_hat)
+
+            # Pre-warm HAT _mask_cache on the UNCOMPILED model before CUDA graph capture.
+            # torch.compile is lazy — first actual call triggers compilation/capture.
+            # By running uncompiled forward once, _mask_cache/_mask_cache_size are set.
+            # The compiled graph then traces the "cache hit" branch: reads _mask_cache
+            # as a module constant rather than writing it as a graph output buffer.
+            # This prevents "tensor output overwritten by subsequent run" on replay.
+            print(f"  Upscale: pre-warming mask cache ({_target}×{_target})...", flush=True)
+            with torch.no_grad():
+                _mwup = torch.rand(1, 3, _target, _target, device=device, dtype=torch.float16)
+                _orig_hat(_mwup)  # run ORIGINAL (uncompiled) model to set _mask_cache
+                del _mwup
+            del _orig_hat
+            torch.cuda.empty_cache()
+            print("  Upscale: mask cache ready", flush=True)
 
             # CUDA graph warmup: trigger compilation/capture before inference starts.
             # NOTE: dynamic-activation FP8 (Float8DynamicActivationFloat8WeightConfig)
