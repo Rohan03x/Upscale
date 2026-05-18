@@ -573,15 +573,39 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         torch.backends.cuda.enable_cudnn_sdp(True)           # cuDNN FA3 on sm_120+ (Blackwell)
         _cmode     = getattr(args, 'compile_mode', 'max-autotune-no-cudagraphs')
         _fullgraph = getattr(args, 'fullgraph', False)
-        _use_cudagraphs = (_cmode == 'reduce-overhead')
-        try:
-            _compiled_hat = torch.compile(
-                upsampler.model, mode=_cmode, dynamic=False, fullgraph=_fullgraph)
-            _cmode_label = 'CUDA graphs' if _use_cudagraphs else 'Triton kernel search'
-            print(f"  Upscale: torch.compile({_cmode}, fullgraph={_fullgraph}) — {_cmode_label}", flush=True)
-        except Exception as _ce:
-            _compiled_hat = upsampler.model
-            print(f"  Upscale: torch.compile failed ({_ce}), using eager", flush=True)
+        _cbackend  = getattr(args, 'compile_backend', 'inductor')
+        _use_cudagraphs = (_cmode == 'reduce-overhead') and (_cbackend == 'inductor')
+        if _cbackend == 'tensorrt':
+            # TensorRT backend via torch.compile — builds a TRT engine on first warmup.
+            # All shapes must be static (tile=512+pad → fixed 544×544 inputs).
+            # FP16 enabled; FP8 handled separately above via torchao quantization.
+            try:
+                import torch_tensorrt  # noqa: F401
+                _trt_opts = {
+                    'enabled_precisions': {torch.float16},
+                    'truncate_long_and_double': True,
+                    'min_block_size': 3,
+                    'torch_executed_ops': [],
+                }
+                _compiled_hat = torch.compile(
+                    upsampler.model, backend='tensorrt', options=_trt_opts)
+                print(f"  Upscale: torch.compile(backend='tensorrt', fp16) — TRT engine build", flush=True)
+            except ImportError:
+                _compiled_hat = upsampler.model
+                print("  Upscale: torch_tensorrt not installed — falling back to eager", flush=True)
+            except Exception as _ce:
+                _compiled_hat = upsampler.model
+                print(f"  Upscale: torch_tensorrt compile failed ({_ce}), using eager", flush=True)
+        else:
+            # Inductor backend (default): Triton kernel search or CUDA graphs
+            try:
+                _compiled_hat = torch.compile(
+                    upsampler.model, mode=_cmode, dynamic=False, fullgraph=_fullgraph)
+                _cmode_label = 'CUDA graphs' if _use_cudagraphs else 'Triton kernel search'
+                print(f"  Upscale: torch.compile({_cmode}, fullgraph={_fullgraph}) — {_cmode_label}", flush=True)
+            except Exception as _ce:
+                _compiled_hat = upsampler.model
+                print(f"  Upscale: torch.compile failed ({_ce}), using eager", flush=True)
 
         # PaddedTileModel: pads edge tiles to target dimensions (next multiple of
         # window_size=16 that fits tile+2*tile_pad).  For tile=384 + tile_pad=16:
@@ -1018,6 +1042,10 @@ def main():
         default='max-autotune-no-cudagraphs',
         choices=['reduce-overhead', 'max-autotune-no-cudagraphs', 'max-autotune', 'default', 'eager'],
         help='torch.compile mode. max-autotune-no-cudagraphs: full Triton search (slower first run, faster steady state). reduce-overhead: CUDA graph capture.')
+    parser.add_argument('--compile-backend', dest='compile_backend', type=str,
+        default='inductor',
+        choices=['inductor', 'tensorrt'],
+        help='torch.compile backend. inductor (default): Triton/CUDA graphs. tensorrt: builds a TRT FP16 engine (requires torch_tensorrt).')
     parser.add_argument('--fullgraph', action='store_true', default=False,
         help='torch.compile fullgraph=True — forces no Python graph breaks. May error if HAT has control flow.')
     parser.add_argument('--pre-downscale', dest='pre_downscale', type=float, default=1.0,
