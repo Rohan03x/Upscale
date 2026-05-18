@@ -1265,16 +1265,22 @@ BENCH CHECKLIST (as of Session 7 end)
   B1     bench_autotune   max-autotune-no-cudagraphs, B=3     DONE      6.60     1.000x  ← BEST
   B-TRT  bench_trt        TRT FP16 + FP8 (conflict)          ABORTED   —        —
   B-MAX  bench_maxautotune max-autotune+CUDA graphs, B=2      CRASHED   —        HARMFUL
-  B-640  bench_tile640    tile=640, max-autotune-no-cg        RUNNING   5.37     1.230x  ← NEW BEST
-  B-TRT2 bench_trt2       TRT FP16, no FP8 (FIXED)           QUEUED    TBD      TBD
+  B-640  bench_tile640    tile=640, max-autotune-no-cg        DONE      5.31     1.243x  ← BEST
+  B-TRT2 bench_trt2       TRT FP16, no FP8 (FIXED)           FAILED    —        —
+  B-PAD8 bench_tile_pad8  tile=640, pad=8, max-autotune-no-cg RUNNING   TBD      TBD
 
-  Active: screen 178731.bench_new2 = (maxautotune DONE) → bench_tile640 → bench_trt2
+  Active: screen bench_pad8 = bench_tile_pad8 RUNNING
   HARMFUL (never retry again):
     channels_last: CRASH (CUDA graph pool error)
     max-autotune (with CUDA graphs): CRASH — _mask_cache pool error (confirmed RTX 3070 + 5090)
     frame-level batch>1 (tile=0): 0.38x catastrophic
     BF16: 0.97x, cudnn.benchmark: 0.88x
     TRT + torchao FP8/INT8: TRT compile fails (mul_16 not lowerable to TRT kernel)
+    TRT backend (any): BLOCKED — HAT native mul op unsupported by TRT 10.12 kernel
+      library on sm_120 (Blackwell). FP8 fix confirmed deployed. Still fails.
+      mul_16 is a HAT model-intrinsic op, not quantization artifact.
+      All TRT tactics OOM (tried 17.4/6.8/11.4/13.9 GB) → no implementation found.
+      NOT FIXABLE without model surgery. TRT is fundamentally incompatible with HAT on sm_120.
 
 ================================================================
 
