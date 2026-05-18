@@ -334,6 +334,15 @@ def _ensure_ort_export(model_name: str, w: int, h: int, tile: int):
     if tile != 0 or model_name not in _HAT_MODELS:
         return None
 
+    # ONNX tracing stores ALL intermediate activations → needs ~14 KB per pixel.
+    # At 1080×1920 (2.07 M px) that is ~28 GB — too large for any single GPU.
+    # Skip export for anything larger than 640×640 (409 K px, needs ~6 GB).
+    _max_px = 640 * 640
+    if w * h > _max_px:
+        print(f"  [TRT] Skipping ONNX export: {w}×{h} ({w*h:,} px > {_max_px:,} px limit)"
+              f" — resolution too large for ONNX tracing VRAM; using PyTorch fallback.")
+        return None
+
     weights_dir = BASE / "tools/Real-ESRGAN/weights"
     onnx_path   = weights_dir / f"{model_name}_{w}x{h}.onnx"
     if onnx_path.exists():
