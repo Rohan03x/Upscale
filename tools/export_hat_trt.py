@@ -86,10 +86,16 @@ def _patch_forward_for_onnx(model: torch.nn.Module, H: int, W: int,
     static graph with no Python-level control flow on variable shapes.
     """
     with torch.no_grad():
+        # HAT window_size=16 — pad H/W to the nearest multiple so calculate_mask
+        # can view the image as an integer number of windows.
+        # (e.g. 1080 → 1088 = 68×16, 1920 → 1920 = 120×16)
+        _ws = model.window_size  # typically 16
+        H_pad = int(np.ceil(H / _ws) * _ws)
+        W_pad = int(np.ceil(W / _ws) * _ws)
         # CPU doesn't support FP16 ops; use FP32 for CPU export — ONNX will store
         # the constant mask in float32.  CUDA export keeps FP16 for matching I/O.
         _mask_dtype = torch.float32 if device.type == "cpu" else torch.float16
-        attn_mask = model.calculate_mask((H, W)).to(device=device, dtype=_mask_dtype)
+        attn_mask = model.calculate_mask((H_pad, W_pad)).to(device=device, dtype=_mask_dtype)
 
     rpi_sa  = model.relative_position_index_SA
     rpi_oca = model.relative_position_index_OCA
@@ -122,7 +128,9 @@ def _patch_forward_for_onnx(model: torch.nn.Module, H: int, W: int,
 def export_onnx(model_name: str, W: int, H: int, device: torch.device,
                 cpu_export: bool = False) -> str:
     """
-    Export the HAT model to ONNX with a fixed (1, 3, H, W) input.
+    Export the HAT model to ONNX with a fixed (1, 3, H_pad, W_pad) input,
+    where H_pad/W_pad are padded to the next multiple of window_size (16).
+    The model internally uses reflect-pad; the output is cropped back to 4×H, 4×W.
 
     cpu_export=True (or auto-selected when GPU OOM is likely):
       Loads the model in FP32 on CPU for the trace.  The resulting ONNX uses
@@ -134,22 +142,26 @@ def export_onnx(model_name: str, W: int, H: int, device: torch.device,
     Returns the path to the written .onnx file.
     """
     os.makedirs(WEIGHTS_DIR, exist_ok=True)
+    # Pad W/H to window_size multiple (16) for HAT's window_partition
+    _ws = 16
+    H_pad = int(np.ceil(H / _ws) * _ws)
+    W_pad = int(np.ceil(W / _ws) * _ws)
     out_path = os.path.join(WEIGHTS_DIR, f"{model_name}_{W}x{H}.onnx")
 
     if cpu_export or device.type == "cpu":
         # FP32 on CPU: no VRAM pressure; TRT builds FP16 engine from FP32 ONNX.
         print(f"Loading {model_name} (FP32, CPU export) ...")
         model_exp = _load_hat(model_name, torch.device("cpu"), half=False)
-        print(f"Patching forward for fixed input {W}x{H} ...")
-        _patch_forward_for_onnx(model_exp, H, W, torch.device("cpu"))
-        dummy = torch.randn(1, 3, H, W, dtype=torch.float32)
+        print(f"Patching forward for fixed input {W_pad}x{H_pad} (padded from {W}x{H}) ...")
+        _patch_forward_for_onnx(model_exp, H_pad, W_pad, torch.device("cpu"))
+        dummy = torch.randn(1, 3, H_pad, W_pad, dtype=torch.float32)
         onnx_dtype = "float32"
     else:
         print(f"Loading {model_name} ...")
         model_exp = _load_hat(model_name, device)
-        print(f"Patching forward for fixed input {W}x{H} ...")
-        _patch_forward_for_onnx(model_exp, H, W, device)
-        dummy = torch.randn(1, 3, H, W, dtype=torch.float16, device=device)
+        print(f"Patching forward for fixed input {W_pad}x{H_pad} (padded from {W}x{H}) ...")
+        _patch_forward_for_onnx(model_exp, H_pad, W_pad, device)
+        dummy = torch.randn(1, 3, H_pad, W_pad, dtype=torch.float16, device=device)
         # Warm-up to trigger any lazy initialisation; then free activations.
         with torch.no_grad():
             _warmup = model_exp(dummy)
