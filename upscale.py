@@ -138,7 +138,7 @@ def _build_venc_final(nvenc_ok: bool) -> list:
     if nvenc_ok:
         return ["-c:v", "hevc_nvenc", "-preset", "p7", "-tune", "hq",
                 "-rc", "constqp", "-qp", "20", "-b:v", "0"]
-    return ["-c:v", "libx265", "-preset", "slow", "-crf", "18",
+    return ["-c:v", "libx265", "-preset", "medium", "-crf", "18",
             "-x265-params", "log-level=error"]
 
 
@@ -828,7 +828,7 @@ def stage_encode(video_src, audio_src, dst, codec="hevc"):
             ]
             label = "Final Encode  HEVC NVENC GPU  CQ14"
         else:
-            vc_args = ["-c:v", "libx265", "-preset", "slow", "-crf", "18",
+            vc_args = ["-c:v", "libx265", "-preset", "medium", "-crf", "18",
                        "-x265-params", "log-level=error"]
             label = "Final Encode  HEVC x265 software  CRF18"
     run([
