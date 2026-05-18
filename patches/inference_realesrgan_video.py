@@ -553,7 +553,7 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
             import torch._inductor.config as _ic
             _ic.coordinate_descent_tuning = True
             _ic.epilogue_fusion = True
-            _ic.coordinate_descent_search_radius = 2
+            _ic.coordinate_descent_search_radius = 1
             print("  Upscale: inductor GEMM coordinate-descent tuning + epilogue fusion enabled",
                   flush=True)
         except Exception:
