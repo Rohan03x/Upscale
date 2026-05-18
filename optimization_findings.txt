@@ -1155,3 +1155,108 @@ B1 BENCH STATUS: max-autotune-no-cudagraphs (RUNNING — 2nd attempt, warm cache
 
 ================================================================
 
+
+================================================================
+ADDITIONAL RESEARCH -- SESSION 7  (2026-05-18)
+================================================================
+
+GPU: RTX 5090 (Blackwell sm_120), 31.36 GiB VRAM
+PyTorch: 2.8.0+cu128, torch_tensorrt 2.8.0+cu128, tensorrt 10.12.0.36
+Inductor cache: /root/autodl-tmp/inductor_cache/ (WARM from B1)
+
+----------------------------------------------------------------
+B1 CONFIRMED FINAL: max-autotune-no-cudagraphs, B=3, FP8
+----------------------------------------------------------------
+
+  Sample measurement (314 frames): 6.60 s/frame (steady-state, consistent).
+  Best Inductor result so far: 6.60 s/frame  (B0=6.97 baseline → 1.056x speedup)
+
+----------------------------------------------------------------
+B-TRT ATTEMPT 1 (bench_trt): ABORTED — TRT compile failure + FP8 conflict
+----------------------------------------------------------------
+
+ROOT CAUSE: torchao FP8 (Float8DynamicActivationFloat8WeightConfig) modifies the
+  model in-place before torch.compile, inserting FP8 dequant scale multiplications.
+  TRT has no kernel implementation for this custom op:
+    ForeignNode[mul_16_rhs + mul_16_broadcast_to_same_shape_rhs_broadcast...
+                [ELEMENTWISE]-[aten_ops.mul.Tensor]-[mul_16]]
+  IBuilder::buildSerializedNetwork Error Code 10: Internal Error
+  TRT fell back to GraphModule (raw eager/Inductor fallback) for ALL subgraphs.
+
+SIDE EFFECTS:
+  - TRT tactic search tried 17.4 GB, 6.8 GB, 11.4 GB, 13.9 GB buffers before failing
+    → all OOM → VRAM exhausted during TILE_BATCH probe
+  - TILE_BATCH fell from 3 to 2 (less memory for real inference after TRT waste)
+  - Inductor fallback at B=2 with FP8 (new shape, no cache) → Triton recompile started
+  - Warmup stuck at 0% GPU util for 5+ minutes → KILLED
+
+VERDICT: ABORTED. Data invalid.
+
+FIX deployed (git 938c37f):
+  patches/inference_realesrgan_video.py: read _cbackend_early BEFORE FP8/INT8 blocks.
+  if _cbackend_early == 'tensorrt': skip FP8 AND skip INT8 (both break TRT compile).
+  TRT FP16 path does not need torchao — TRT handles precision internally.
+
+NEW: bench_trt2.sh — clean TRT FP16 (no torchao quant, full TRT compile expected)
+  Expected: TILE_BATCH=3 (less VRAM consumed without TRT's failed tactic allocations)
+  Expected: Full model compiled by TRT, genuine FP16 engine speedup.
+
+----------------------------------------------------------------
+B-MAX (bench_maxautotune): RUNNING — max-autotune WITH CUDA graphs
+----------------------------------------------------------------
+
+  Config: max-autotune (Triton kernel search + CUDA graphs), B=2, FP8, tile=512
+  TILE_BATCH=2 (CUDA graph capture consumes more VRAM than max-autotune-no-cudagraphs)
+  NOTE: B=3 with max-autotune (no-cg) gave 6.60. B=2 here = 6 passes/frame vs 4.
+    CUDA graphs need to be significantly faster per pass to compensate.
+  STATUS: Warmup in progress (max-autotune + FP8 + CUDA graphs, may take 10-30 min).
+  RISK: RTX 3070 crashed with _mask_cache pool error under max-autotune CUDA graphs.
+    RTX 5090 uses _PaddedTileModel (static shapes pre-fixed). Mask is pre-warmed.
+    May work on 5090 where it couldn't on 3070.
+  RESULT: TBD
+
+----------------------------------------------------------------
+B-640 (bench_tile640): QUEUED — tile=640, fewer forward passes per frame
+----------------------------------------------------------------
+
+  Theory: tile=640 → 3×2=6 tiles/frame (padded to 660×660) vs 12 at tile=512.
+  TILE_BATCH probe at 660×660: expect B=2 (large tile uses more VRAM).
+  Forward passes/frame: tile=640/B=2 → 3 passes vs tile=512/B=3 → 4 passes.
+  Each pass is larger (660×660 vs 544×544 = 1.47x more pixels), but 25% fewer passes.
+  Net compute change: 3/4 × 1.47 = 1.10x MORE compute. Likely SLOWER overall.
+  Quality: IDENTICAL — tile size has no effect on HAT model output quality.
+  RESULT: TBD (may be slower due to increased per-pass compute)
+
+----------------------------------------------------------------
+B-TRT2 (bench_trt2): QUEUED — TRT FP16, no torchao (FIXED run)
+----------------------------------------------------------------
+
+  Theory: Without FP8 ops, TRT compiles clean FP16 HAT model.
+  Expected TILE_BATCH=3 (TRT tactic search won't OOM without FP8 conflict).
+  TRT FP16 on Blackwell: potential 1.3-1.5x speedup over Inductor FP16.
+  Even if B=3 recovers: 4 passes/frame × TRT-faster-per-pass vs Inductor B=3.
+  Quality: TRT FP16 = full precision attention, no quantization — IDENTICAL to base.
+  RESULT: TBD
+
+----------------------------------------------------------------
+BENCH CHECKLIST (as of Session 7 end)
+----------------------------------------------------------------
+
+  #      Name             Config                              Status    s/frame  vs 6.60
+  ------------------------------------------------------------------------------------------
+  B0     baseline         reduce-overhead, B=3, FP8           DONE      6.97     0.946x
+  B1     bench_autotune   max-autotune-no-cudagraphs, B=3     DONE      6.60     1.000x  ← BEST
+  B-TRT  bench_trt        TRT FP16 + FP8 (conflict)          ABORTED   —        —
+  B-MAX  bench_maxautotune max-autotune+CUDA graphs, B=2      RUNNING   TBD      TBD
+  B-640  bench_tile640    tile=640, max-autotune-no-cg        QUEUED    TBD      TBD
+  B-TRT2 bench_trt2       TRT FP16, no FP8 (FIXED)           QUEUED    TBD      TBD
+
+  Active: screen 178731.bench_new2 = bench_maxautotune → bench_tile640 → bench_trt2
+  HARMFUL (never retry again):
+    channels_last: CRASH (CUDA graph pool error)
+    frame-level batch>1 (tile=0): 0.38x catastrophic
+    BF16: 0.97x, cudnn.benchmark: 0.88x
+    TRT + torchao FP8/INT8: TRT compile fails (mul_16 not lowerable to TRT kernel)
+
+================================================================
+
