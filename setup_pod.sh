@@ -22,7 +22,9 @@ echo "================================================================"
 echo ""
 echo "[1/7] System packages..."
 apt-get update -qq
-apt-get install -y -q ffmpeg screen git wget 2>&1 | tail -5
+apt-get install -y -q screen git wget 2>&1 | tail -5
+# Install ffmpeg 8.x from conda-forge (apt 4.4 has no NVENC support for Blackwell RTX 50xx)
+conda install -c conda-forge ffmpeg -y 2>&1 | tail -3 || apt-get install -y -q ffmpeg
 apt-get install -y -q libvid-stab-dev 2>/dev/null || true  # not in Ubuntu 22.04 minimal; ffmpeg already has vidstab
 
 # ── 2. Python packages ────────────────────────────────────────────────────────
