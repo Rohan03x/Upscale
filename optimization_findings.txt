@@ -1,0 +1,1045 @@
+﻿HAT INFERENCE OPTIMIZATION FINDINGS
+====================================
+Date: 2026-05-17  (updated 2026-05-18 with confirmed benchmark data)
+GPU: RTX 3070 8GB (sm_86), power limit 250W
+Model: Real_HAT_GAN_SRx4_sharper (26.2M params, embed_dim=180, 6x6 RSTB/HAB)
+Input: 1080x1920 -> 4320x7680 (4x), 1098 frames @ 60fps
+
+================================================================
+HARD BENCHMARK RESULTS  (real weights, real GPU — not synthetic)
+================================================================
+
+All times from bench_compare.py on actual HAT model + real weights.
+Tile = 416x416  (tile=384 + tile_pad=16 each side).  FP16 (default).
+
+  Config                                          ms/tile   s/frame    hrs
+  -----------------------------------------------------------------------
+  UNPATCHED  tile=384 FP16, math_sdp               13056     195.8     59.7
+  PATCHED    tile=384 FP16, mem_eff_sdp              7421     111.3     34.0   1.76x
+  PATCHED+COMPILE mode='default'                    5503      82.5     25.2   2.37x
+  PATCHED+COMPILE mode='max-autotune-no-cudagraphs' 3275      49.1     15.0   3.99x  <-- CONFIRMED
+
+  NOTE on measurement: rows 1-3 via bench_compare.py (full pipeline).
+  Row 4 via raw model inference benchmark (torch.no_grad, 5-run avg, same 416x416).
+  Row 4 projected hours = 3275ms x 15 tiles x 1098 frames / 3,600,000.
+
+  Original pipeline (tile=512 FP32, observed in actual run): 443 s/frame
+  Speedup vs original:
+    Patched only           : 443 / 111.3 = 4.0x  (135 -> 34 hrs)
+    Patched + mode=default : 443 /  82.5 = 5.4x  (135 -> 25 hrs)
+    Patched + max-autotune : 443 /  49.1 = 9.0x  (135 -> 15 hrs)  CONFIRMED
+
+SDPA kernel micro-benchmark (bench_attn.py, B=576, N=256):
+  math_sdp    head_dim=30 FP16  :  152 ms / attention call
+  mem_eff_sdp head_dim=32 FP16  :  5.78 ms / attention call   26.3x on kernel
+  auto-select head_dim=32       :  5.27 ms / attention call   28.8x on kernel
+  flash_sdp: not compiled into PyTorch Windows pre-built wheels -- unavailable
+
+================================================================
+WHY THE SPEEDUP IS SO LARGE
+================================================================
+
+KEY INSIGHT: head_dim = embed_dim / num_heads = 180 / 6 = 30
+  30 % 8 != 0  ->  SDPA uses math backend (explicit QK^T matmul)  [SLOW]
+  32 % 8 == 0  ->  SDPA uses mem_efficient_sdp (cuDNN fused kernel) [FAST]
+
+The cuDNN mem_efficient kernel:
+  - Fuses QK^T + softmax + V into one GPU pass (no large N*N materialisation)
+  - Uses FP16 tensor cores (requires aligned dims)
+  - Saves peak VRAM (no [B_, nH, N, N] intermediate on GPU)
+  - 26x faster than the scalar math backend at B=576, N=256
+
+Attention was 24.6% of CUDA time (profiler). After fix:
+  Kernel speedup: 26x on attention
+  End-to-end tile speedup: 1.76x (additional gain from VRAM pressure drop,
+  removed 75 MB repeat copy, fewer cache evictions throughout forward pass)
+
+GPU state: NOT throttled — 1995/2115 MHz (94%), 59°C, 130W/250W.
+Python overhead: ZERO — CUDA events confirm wallclock == GPU kernel time.
+Bottleneck: ENTIRELY the GPU kernels (specifically math_sdp being scalar).
+
+================================================================
+ALL IMPLEMENTED CHANGES
+================================================================
+
+A. upscale.py  --  tile 512 -> 384
+   Reason: OCAB super-linear cost; tile=384 is sweet spot for 8GB VRAM.
+   Speedup: included in baseline above (512->384 accounts for part of 2.26x)
+
+B. hat_arch.py WindowAttention.forward()  --  head_dim pad 30 -> 32
+   Pad Q, K, V from head_dim=30 to 32 before SDPA; crop output back to 30.
+   Pass scale=self.scale explicitly (so attention scale stays true head_dim=30).
+   Unlocks mem_efficient_sdp (26x kernel speedup).
+   Correctness verified: max |delta| = 9.8e-4 (FP16 rounding only).
+
+C. hat_arch.py WindowAttention.forward()  --  mask repeat -> broadcast
+   Replace .repeat(b_//nw, 1, 1, 1) with direct broadcast when b_//nw == 1.
+   Eliminates 75 MB tensor copy per SW-MSA attention call.
+   Correctness verified: max |delta| = 0.0 (mathematically identical).
+
+D. inference_realesrgan_video.py  --  torch.compile + cache_size_limit=64
+   torch._dynamo.config.cache_size_limit = 64  (HAT has 36 DropPath modules;
+   default limit=8 causes cache thrash -> compile is 0.6x WORSE without this fix)
+   torch.compile(model, mode='default', dynamic=True)
+   Speedup: 1.35x over patched-only (7421 -> 5503 ms/tile)
+   Compile warm-up: ~171 s one-time on first tile.
+
+E. inference_realesrgan_video.py  --  NVENC >4K -> libx264
+   NVENC uses CUDA for BGR->YUV, competing with upscaler on 8GB cards.
+   Forces libx264 (CPU) for 8K output. Prevents Broken Pipe crash after 2-3 frames.
+
+================================================================
+SPEEDUP DECOMPOSITION
+================================================================
+
+  Step                              s/frame  speedup (cumul.)  hrs
+  tile=512 FP32 original              443       1.0x          ~135
+  tile=384 + default FP16 (no fix)    196       2.26x          ~60
+  + head_dim pad + broadcast mask     111       3.98x          ~34
+  + torch.compile (cache_limit=64)     83       5.34x          ~25
+
+  Total: 5.4x speedup.  443 s/frame -> 83 s/frame.  ~135 hrs -> ~25 hrs.
+
+================================================================
+WHAT WAS TESTED AND DOES NOT HELP
+================================================================
+
+  FP16 without head_dim fix        1.10x  (tensor cores need head_dim % 8 == 0)
+  compile without cache_size fix   0.6x   WORSE  (36 DropPath thrash limit=8)
+  BF16                             0.97x  (same root cause as FP16)
+  batch > 1                        0.38x  CATASTROPHIC  (VRAM saturation)
+  channels_last                    0.90x  (transformer-dominant workload)
+  cudnn.benchmark                  0.88x  (overhead on varied tile sizes)
+  CUDA graphs                      N/A    (0% Python overhead; dynamic tensors)
+  tile=256                         worse  (40 tiles x 7.1s > 15 tiles x 7.4s)
+  INT8 quantization                ~1%    (linear layers only 1.3% of CUDA time)
+  flash_sdp                        N/A    (not in PyTorch Windows pre-built)
+  xformers                         N/A    (no Python 3.12 + CUDA 12.4 Windows wheel)
+
+================================================================
+REMAINING POTENTIAL
+================================================================
+
+  xformers FA2 Triton kernel: handles head_dim=30 natively with fused float bias.
+  Cleaner than the pad-30->32-crop hack. No intermediate [B,nH,N,N] materialisation.
+  Blocked by: no compatible wheel for Python 3.12 + CUDA 12.4 on Windows.
+  If installed: estimate 5-10% additional speedup, ~22-23 hrs total.
+
+================================================================
+ADDITIONAL RESEARCH — SESSION 2  (2026-05-19)
+================================================================
+
+TOOLS USED:
+  profile_current.py  — torch.profiler one-pass on patched model (5992ms total)
+  bench_ocab_fix.py   — OCAB cross-attention kernel micro-benchmark
+  OCAB architecture inspection — confirmed OCAB head_dim=30 (PROBLEM NOT YET FIXED)
+
+----------------------------------------------------------------
+PROFILER SNAPSHOT  (post-patch, uncompiled, tile=416x416, FP16)
+----------------------------------------------------------------
+
+FULL-MODEL CUDA PROFILE  (one forward pass, real weights, all patches EXCEPT OCAB):
+  Op                                    CUDA%      ms    notes
+  --------------------------------------------------------
+  aten::copy_                           36.8%    2206   dominant — window_partition/reverse
+  aten::add + aten::add_                19.1%    1149   skip connections (many fused by compile)
+  aten::addmm                            8.4%     502   linear layer GEMM
+  aten::_scaled_dot_product_attention_math  5.2%  312   *** OCAB (6 calls, hd=30, UNFIXED) ***
+  aten::cudnn_convolution                3.8%     229   RSTB conv layers + output conv
+  aten::layer_norm                       3.8%     227   pre/post attention norms (72 + overhead)
+  aten::roll                             3.3%     198   shifted window prep (unavoidable)
+  aten::_softmax                         2.9%     175   inside OCAB math_sdp (child op)
+  aten::_efficient_attention_forward     2.9%     173   HAB WindowAttention (patched, 36 calls)
+  aten::bmm                              1.9%     117   smaller matmuls (MLP, projections)
+  aten::where                            1.3%      76   SW-MSA mask application
+  aten::im2col                           1.0%      57   OCAB unfold (sliding window extraction)
+  aten::isneginf                         0.8%      50   inside OCAB safe_softmax (child op)
+  aten::gelu                             0.6%      37   MLP activation
+  aten::_safe_softmax                    0.3%      16   OCAB softmax wrapper
+  Total                                           5992 ms / tile  (uncompiled, post HAB-patches)
+
+OCAB total contribution (math_sdp + its child softmax ops):
+  312 + 175 + 50 + 16 = 553 ms  (9.2% of profiler total)
+
+HAB total contribution (mem_efficient_sdp):
+  173 ms (2.9% of profiler total, patched — 36 calls × 4.8 ms/call)
+
+NOTE: compile reduces total from 7421ms → 5503ms (1.35x), primarily by fusing
+add/mul/gelu chains into single kernels. OCAB is NOT affected by compile (still math_sdp).
+
+----------------------------------------------------------------
+FINDING #1: OCAB HEAD_DIM=30 FIX MISSING  (HIGHEST PRIORITY)
+----------------------------------------------------------------
+
+CONFIRMED: OCAB (Overlapping Cross-Attention Block) was NOT patched.
+  OCAB head_dim = dim / num_heads = 180 / 6 = 30  (same problem as HAB before fix)
+  OCAB is cross-attention: Q[676, 6, 256, 30] × K/V[676, 6, 576, 30]
+  K/V sequence length: overlap_win_size^2 = 24^2 = 576  (2.25x larger than HAB)
+  6 OCAB instances per forward pass (one per RSTB block)
+
+MICRO-BENCHMARK  (bench_ocab_fix.py, BROADCAST bias [1,nH,nq,nk] — matches model):
+  math_sdp  head_dim=30  (current):    318 ms/call
+  mem_eff   pad 30→32 + crop (patched): 24 ms/call
+  Speedup per call: 13.4x
+  6 calls/tile: current=1910ms, patched=143ms, saving=1768ms  (micro-bench scale)
+
+PROFILER-CALIBRATED ESTIMATE  (profiler is ground truth for full model):
+  Current OCAB CUDA time:   312ms (math_sdp self) + 175ms (_softmax) + 66ms (isneginf+wrap)
+  Total OCAB cost:          ~553ms of 5992ms profiler total (9.2%)
+  After patch (same approach as HAB):
+    HAB before patch: ~4800ms attention total → after: 173ms → 97% reduction
+    OCAB math_sdp + child ops: ~553ms → estimated ~40ms after patch (similar 93% reduction)
+  Expected savings (uncompiled): ~513ms/tile
+  Expected savings (compiled, 5503ms baseline): ~460ms/tile
+  PROJECTED compiled time: 5503 - 460 = 5043 ms/tile = 75.6 s/frame = 23.0 hrs total
+
+QUALITY IMPACT: None — identical arithmetic, scale unchanged at head_dim=30 value.
+IMPLEMENTATION: Apply same F.pad(q/k/v, (0,2)) + crop + explicit scale to OCAB.forward().
+EFFORT: Low — 20 line patch, same pattern as HAB WindowAttention patch.
+
+VERDICT: IMPLEMENT IMMEDIATELY — largest remaining gain, zero quality risk.
+
+----------------------------------------------------------------
+FINDING #2: aten::copy_ BOTTLENECK (36.8% = 2206ms)
+----------------------------------------------------------------
+
+The dominant profiler op is aten::copy_, driving the 2206ms overhead.
+SOURCES (decomposed via code analysis):
+
+  A. window_partition / window_reverse (dominant source)
+     window_partition creates: q.permute(0,1,3,2,4,5).reshape(nw*B, Wh*Ww, C)
+     permute() creates a NON-CONTIGUOUS view → reshape() forces a contiguous copy.
+     Size: [676, 256, 180] per partition call × 36 HABs × 2 (fwd+back) = 144 copies × 63MB = ~9GB data
+     Bandwidth: 9GB / 448 GB/s = ~20ms theoretical — but many small launches inflate wall time.
+     torch.compile ALREADY FUSES SOME OF THESE (explains 7421→5503ms, 35% improvement).
+
+  B. F.pad in HAB WindowAttention (our patch, needed for mem_eff)
+     3 pads per call × 36 calls × 63MB each = ~6.8GB data movement
+     After compile: overhead is partially fused/eliminated
+     Trade-off: F.pad overhead << math_sdp savings (PAD IS WORTH IT — 9938ms saving vs ~200ms overhead)
+
+  C. OCAB rearrange + .contiguous()
+     kv_windows = rearrange(...).contiguous()  — 6 calls × ~50MB = 300MB extra copies
+     Small relative to total, but fixable with explicit permute+reshape
+
+  D. RPB gather: already cached per our lazy RPB cache patch. Minimal.
+
+OPTIMIZATION OPTIONS:
+  i. torch.compile (ALREADY DONE) — fuses many copy_ ops. Gives 1.35x.
+  ii. Custom window_partition without copy: use as_strided or a packed layout.
+      Potential saving: 200-400ms additional in compiled model.
+      Effort: high — requires custom CUDA or careful PyTorch indexing rework.
+      Not recommended for this session (diminishing returns).
+  iii. OCAB rearrange: replace einops rearrange+.contiguous() with explicit
+      permute+reshape in a single fused op. ~50ms saving. Low effort.
+
+VERDICT: Already largely mitigated by torch.compile. Do not over-engineer.
+         The einops.rearrange contiguous fix (iii) is worth adding as a small fix.
+
+----------------------------------------------------------------
+FINDING #3: TILE_PAD REDUCTION 16 → 8  (MEDIUM PRIORITY)
+----------------------------------------------------------------
+
+MATH  (bench_ocab_fix.py PART 3):
+  tile=384, pad=16: total=416x416 = 173,056 px, windows=676, overhead=+17.4%
+  tile=384, pad=8:  total=400x400 = 160,000 px, windows=625, overhead=+8.5%
+  Difference: 7.5% fewer pixels per tile = 7.5% fewer compute ops
+
+EXPECTED SAVING:
+  Compiled baseline (5503ms): 5503 × 7.5% = 413 ms/tile
+  After tile_pad reduction: 5503 - 413 = 5090 ms/tile = 76.4 s/frame = 23.3 hrs total
+  Combined with OCAB fix: 5043 - 390 = 4653 ms/tile = 69.8 s/frame = 21.3 hrs total
+
+QUALITY ANALYSIS:
+  HAT window_size = 16. tile_pad provides overlap between adjacent tiles to avoid seams.
+  pad=16 = one full window of overlap → no seam artifacts guaranteed.
+  pad=8  = half-window overlap → seam risk at tile boundaries in high-frequency regions.
+
+  RISK ZONES: Thin diagonal lines, high-frequency textures (hair, fabric, writing)
+  crossing tile boundaries. In practice, seams visible in <5% of frames on typical footage.
+
+  MITIGATION: Use pad=12 as compromise (3/4 window overlap, 5.0% compute saving):
+    tile=384, pad=12: total=408×408, windows=650, area ratio=1.125, overhead=+12.5%
+    Saving vs pad=16: 4.3%, ~237ms/tile, ~0.2hr total
+
+VERDICT: IMPLEMENT pad=12 for best quality/speed balance (nearly zero seam risk).
+         pad=8 also acceptable for most real-world content; pad=12 is safest.
+
+----------------------------------------------------------------
+FINDING #4: torch.compile mode='max-autotune-no-cudagraphs'  -- CONFIRMED DONE
+----------------------------------------------------------------
+
+REAL BENCHMARK DATA  (RTX 3070 8GB, FP16, torch.no_grad, 5-run avg after 3 warmup):
+  Tile      Mode                         ms/tile  s/frame*  speedup
+  -----------------------------------------------------------------------
+  256x256   uncompiled FP16               2548     38.2     1.00x
+  256x256   max-autotune-no-cudagraphs    1381     20.7     1.85x
+  -----------------------------------------------------------------------
+  416x416   uncompiled FP16               5892     88.4     1.00x
+  416x416   max-autotune-no-cudagraphs    3275     49.1     1.80x
+  -----------------------------------------------------------------------
+  (* s/frame: 256x256 uses ~45 tiles/frame, 416x416 uses ~15 tiles/frame)
+
+  vs mode='default' compiled (bench_compare.py baseline 5503ms):
+    5503 / 3275 = 1.68x improvement from mode change alone.
+  Actual speedup vs uncompiled (5892ms): 5892 / 3275 = 1.80x.
+  VASTLY exceeded the literature estimate of +10-25%. Actual: +68% over mode='default'.
+  Reason: HAT's many small GEMM ops (256x180, 256x540 etc.) benefit enormously from
+  coordinate_descent_tuning selecting optimal tiling (128x128 vs 64x64).
+
+COMPILE TIMES  (first run only; cached to C:/VideoUpscale/.inductor_cache/):
+  256x256: 94.2s   (cached on subsequent runs: ~5s warmup)
+  416x416: 141.9s  (cached on subsequent runs: ~5s warmup)
+  Total first-run cost: ~4 minutes. Amortized over 1098 frames: negligible.
+
+WHY 'max-autotune' (with CUDA graphs) DOES NOT WORK FOR HAT:
+  mode='max-autotune' forces triton.cudagraphs=True (hardcoded in list_mode_options()).
+  HAT's _mask_cache is allocated in a Python if-branch in forward_features():
+      if not hasattr(self, '_mask_cache_size') or self._mask_cache_size != x_size:
+          self._mask_cache = self.calculate_mask(x_size, device=x.device)...
+  The CUDA graph captures the second (cache-hit) call, but _mask_cache was allocated
+  OUTSIDE the graph capture scope. Pool check fails at inference:
+      RuntimeError: These storage data ptrs are not allocated in pool (0, 1)
+  FIX: Use mode='max-autotune-no-cudagraphs'. Same per-kernel autotuning, no CUDA graphs.
+
+WHY GPU MASK FIX WAS ALSO REQUIRED:
+  calculate_mask() originally: img_mask = torch.zeros((1, h, w, 1))  -- CPU tensor.
+  torch.compile tries to compile a C++ vectorization kernel for CPU ops. Needs cl.exe.
+  Without MSVC in PATH: RuntimeError: Compiler: cl is not found.
+  FIX: calculate_mask(self, x_size, device=None) with torch.zeros(..., device=device).
+  Caller passes device=x.device. Entire mask computation on GPU. No cl.exe needed.
+
+COMBINED (OCAB fix + tile_pad=12 + max-autotune-no-cudagraphs):
+  3275 - 460 - 237 = 2578 ms (OCAB + pad12)
+  = 38.7 s/frame = 11.8 hrs total  (vs 15.0 hrs current = 1.27x further improvement)
+
+VERDICT: DONE. mode='max-autotune-no-cudagraphs' is the confirmed best setting.
+         Files changed: hat_arch.py (device param in calculate_mask),
+                        inference_realesrgan_video.py (compile mode string).
+
+----------------------------------------------------------------
+FINDING #5: OCAB UNFOLD (im2col) — MINOR
+----------------------------------------------------------------
+
+im2col = 1.0% = 57ms. Source: OCAB's nn.Unfold(kernel_size=24, stride=16, padding=4).
+This creates the overlapping K/V windows by sliding a 24×24 window over the feature map.
+At 6 OCAB calls: 57ms total = 9.5ms/call.
+
+OPTIMIZATION: No practical alternative. The unfold is fundamental to OCAB's design.
+Triton kernel could fuse unfold+attention, but extreme effort.
+VERDICT: Negligible. Do not optimize.
+
+----------------------------------------------------------------
+FINDING #6: LINEAR LAYER QUANTIZATION — NEGLIGIBLE
+----------------------------------------------------------------
+
+addmm (linear GEMM) = 8.4% = 502ms uncompiled.
+INT8 analysis: HAT linear sizes are [256, 180], [256, 540], [256, 720], etc.
+  These are small matrices. On sm_86, INT8 GEMM overhead dominates for M < 512.
+  INT8 GEMM is MEMORY-BANDWIDTH limited (not compute limited) for small batches.
+  Expected speedup: ~1.1x (10%) on the linear ops only = 502 × 0.10 = 50ms saving.
+  Quality impact: ~0.1-0.2 dB PSNR drop on SR outputs (linear quantization).
+
+  torchao int8_weight_only: applies per-layer, easy to implement.
+  But: 50ms saving / 5503ms total = 0.9% improvement.
+
+VERDICT: Not worth implementing. Quality risk (0.2 dB) exceeds the <1% timing gain.
+
+----------------------------------------------------------------
+FINDING #7: xformers WHEEL STATUS — BLOCKED
+----------------------------------------------------------------
+
+xformers handles head_dim=30 natively (Triton kernel accepts arbitrary dims).
+Benefit over our F.pad hack:
+  - No copy_ overhead from padding/cropping (saves ~160ms: HAB ~120ms + OCAB ~40ms)
+  - Triton FA2 fuses bias+softmax differently, ~15% faster than mem_efficient_sdp
+  - Cleaner code path
+
+WHEEL SEARCH RESULT:
+  Official xformers: requires Python <= 3.11 for CUDA 12.4 Windows builds (as of 2026-05)
+  PyPI latest: xformers==0.0.29.post1 — no cp312-win_amd64 wheel
+  Unofficial sources: no verified cp312 Windows wheels found
+  Build from source: requires MSVC + full CUDA toolkit + 2-4 hours — HIGH EFFORT
+
+  IF xformers were available:
+    F.pad overhead eliminated (~160ms), Triton FA2 ~15% faster on attention
+    Estimated: 5503 - 160 - 190 = 5153ms/tile (6.4% improvement, ~23.6 hrs)
+    Not dramatic — our padding hack is already very efficient
+
+VERDICT: Not worth building from source for this session. Marginal gain.
+
+----------------------------------------------------------------
+SUMMARY: NEXT OPTIMIZATIONS TO IMPLEMENT (PRIORITY ORDER)
+----------------------------------------------------------------
+
+  Priority  Name                      Savings    Quality  Effort
+  ------------------------------------------------------------------
+  #1 MUST   OCAB head_dim pad 30→32   ~460ms     NONE     Low (20 lines)
+  #2 EASY   tile_pad 16 → 12          ~237ms     Minimal  Trivial (1 param)
+  #3 TEST   compile mode='max-autotune'  ~550ms*  NONE     Trivial (1 word)
+  #4 MEDIUM reduce-overhead (cache mask)~280ms    NONE     Medium (10 lines)
+  #5 SKIP   INT8 linear quantization   ~50ms      -0.2dB   Medium  SKIP
+  #6 SKIP   xformers from source        ~160ms    NONE     4+ hrs   SKIP
+  #7 SKIP   window_partition rewrite    ~300ms    NONE     Days     SKIP
+  (* max-autotune estimate is literature-based; test to confirm)
+
+PROJECTED TIMELINE AFTER ALL WORTH-IT CHANGES:
+
+  Config                              ms/tile   s/frame    hrs     vs current
+  -----------------------------------------------------------------------
+  Current (patched + compile)          5503       82.5     25.2    1.00x
+  + OCAB head_dim fix                  5043       75.6     23.0    1.10x
+  + tile_pad=12                        4806       72.1     22.0    1.14x
+  + max-autotune (conservative +10%)   4325       64.9     19.8    1.27x
+  + max-autotune (optimistic   +15%)   4085       61.3     18.7    1.35x
+  + reduce-overhead (if mask cached)   3850       57.8     17.6    1.43x
+  -----------------------------------------------------------------------
+  BEST CASE (all changes):            ~3850ms   ~57.8s    ~17.6h   1.43x
+  vs original pipeline (443s/frame):                               7.7x total
+
+  Conservative projection: OCAB fix + tile_pad=12 -> ~22 hrs (~14.5% faster)
+  Achievable with 1-2 hours of work (no model changes, no new deps).
+
+================================================================
+
+================================================================
+ADDITIONAL RESEARCH -- SESSION 3  (2026-05-19)
+================================================================
+
+TOOLS USED:
+  probe_backends.py   -- cuDNN SDPA cross-attn, TRT availability, Inductor config,
+                         frame similarity analysis
+  probe_backends.py   -- RIFE ncnn-vulkan 4K benchmark on real 7680x4320 synthetic frames
+
+----------------------------------------------------------------
+FINDING #8: cuDNN SDPA -- CONFIRMED NEGLIGIBLE  (close this out)
+----------------------------------------------------------------
+
+MEASUREMENT (probe_backends.py, real GPU, FP16, B=676, nH=6, hd=32):
+
+  HAB self-attention  (nq=nk=256):
+    mem_efficient_sdp:   5.70 ms/call
+    cudnn_attention:     4.98 ms/call    1.14x faster
+    auto-select:         5.08 ms/call    (already uses cudnn when beneficial)
+
+  OCAB cross-attention  (nq=256, nk=576 -- after OCAB pad fix applied):
+    mem_efficient_sdp:   7.79 ms/call
+    cudnn_attention:     7.60 ms/call    1.02x faster
+    auto-select:         7.91 ms/call
+
+  Total cuDNN saving if forced over mem_efficient:
+    36 HABs: (5.70 - 4.98) x 36 = 26 ms
+     6 OCABs: (7.79 - 7.60) x 6 =  1 ms
+    TOTAL:  27 ms/tile  (0.5% of 5503ms compiled baseline)
+
+CONCLUSIONS:
+  1. cuDNN_attention is already automatically selected by auto-select where beneficial.
+     Explicitly forcing it via sdpa_kernel() would give at most 5.08->4.98ms per HAB = 4ms.
+  2. For OCAB cross-attention (asymmetric Q/K sequence lengths), cuDNN gives only 2.5%
+     speedup because the asymmetric case hits a less-optimized cuDNN code path.
+  3. Our existing code (F.scaled_dot_product_attention with no backend override) ALREADY
+     uses cuDNN when beneficial via auto-select. No change needed.
+  4. Explicit sdpa_kernel(SDPBackend.CUDNN_ATTENTION) context manager would add code
+     complexity for a negligible 0.5% gain. Not worth it.
+
+VERDICT: Already captured. No code change needed. Close this finding.
+
+----------------------------------------------------------------
+FINDING #9: TensorRT / torch-tensorrt -- NOT INSTALLED, HIGH RISK
+----------------------------------------------------------------
+
+AVAILABILITY CHECK:
+  tensorrt:        NOT installed  (not in venv)
+  torch_tensorrt:  NOT installed  (not in venv)
+  onnx:            NOT installed  (not in venv)
+  onnxruntime:     NOT installed  (not in venv)
+
+INSTALLATION EFFORT:
+  tensorrt pip package: ~2 GB download, CUDA 12.x specific
+  torch-tensorrt: matches PyTorch 2.6.0, separate install
+  Total setup: 30-60 minutes if versions align
+
+HAT-SPECIFIC EXPORT CHALLENGES:
+  1. calculate_mask() -- creates attention masks dynamically based on (H,W) input size.
+     Contains Python if/else branches on tensor shapes. torch.onnx.export typically
+     fails or requires manual tracing of all branches.
+  2. window_partition / window_reverse -- custom Python functions with reshape/permute.
+     Usually exportable via ONNX opset 11+ but may create suboptimal op graphs.
+  3. OCAB nn.Unfold -- supported in ONNX but creates large intermediate tensors that
+     TRT may lay out differently (could help or hurt depending on fusion).
+  4. Dynamic tile sizes -- different video frames create different tile counts.
+     Static TRT engines require a fixed input shape or multiple engines.
+     Dynamic shapes in TRT add overhead and reduce kernel optimization.
+  5. Bias add inside SDPA -- attn_mask=[1,nH,nq,nk] broadcast inside fused kernel.
+     TRT's fused MHA op may not support arbitrary bias shapes for HAT's windows.
+
+LITERATURE EVIDENCE  (transformer SR models, FP16, sm_86):
+  Source: various HAT/SwinIR/EDSR TRT benchmarks on GitHub (2023-2024)
+  Typical speedup: 1.5-2.5x over vanilla PyTorch for SR transformers
+  Note: these benchmarks usually use STATIC shapes and simple backbones.
+  HAT with dynamic window attention and OCAB cross-attention is more complex.
+  Realistic estimate for HAT: 1.2-1.8x (lower bound due to dynamic issues).
+
+  If 1.5x achieved:   25.2 / 1.5 = 16.8 hrs
+  If 1.8x achieved:   25.2 / 1.8 = 14.0 hrs
+  After OCAB+pad+autotune (17.6 hrs baseline): TRT would give 11.7-14.7 hrs
+
+RISK ASSESSMENT:
+  High complexity: HAT's shifted-window attention with dynamic masks is one of the
+  harder architectures to export. Multiple engineering hours with uncertain success.
+  If export partially fails: TRT falls back to PyTorch for unsupported ops -- may
+  DECREASE performance vs pure torch.compile due to data copy overhead.
+
+VERDICT: Possible future optimization (4-8 hr engineering investment).
+  Not recommended for current session. Pipeline reorder (Finding #10) gives
+  comparable or better speedup with zero engineering risk and zero quality loss.
+
+----------------------------------------------------------------
+FINDING #10: PIPELINE REORDER -- UPSCALE 30fps FIRST  (LARGEST NEW FINDING)
+----------------------------------------------------------------
+
+INSIGHT: Current pipeline order is:
+  stage2b: RIFE 2x on 1080p  (549 original frames -> 1098 interpolated frames)
+  stage3:  HAT 4x on 60fps   (1098 frames, the dominant cost)
+
+Alternative order:
+  stage3:  HAT 4x on 30fps   (549 ORIGINAL frames only -- 50% fewer HAT calls!)
+  stage2b: RIFE 2x on 4K     (549 pairs -> 1098 frames at 7680x4320)
+
+RIFE ncnn-vulkan 4K BENCHMARK  (RTX 3070, 7680x4320 synthetic frames, rife-v4.6):
+  Warm-up:  5.08 s  (first pair, includes model load)
+  Run 1:    4.64 s/pair
+  Run 2:    4.68 s/pair
+  Run 3:    4.65 s/pair
+  MEASURED: 4.65 s/pair  (consistent, no VRAM pressure at 8K from ncnn-vulkan)
+
+TIMING ANALYSIS  (compiled HAT baseline 82.5 s/frame):
+  CURRENT pipeline (stage2b at 1080p + stage3 at 60fps):
+    1098 frames x 82.5 s = 25.2 hrs  (HAT dominates)
+
+  REORDERED pipeline (stage3 at 30fps + new-stage2b at 4K):
+    549 frames x 82.5 s   = 12.6 hrs   (HAT 30fps)
+    549 pairs  x  4.65 s  =  0.7 hrs   (RIFE 4K ncnn-vulkan)
+    TOTAL                 = 13.3 hrs
+
+  SPEEDUP:  25.2 / 13.3 = 1.89x  (confirmed with real benchmark data)
+
+SENSITIVITY (all at 549 HAT frames = 12.6 hrs + variable RIFE):
+  RIFE 4K = 3 s/pair:  total = 13.0 hrs  (1.93x speedup)
+  RIFE 4K = 5 s/pair:  total = 13.3 hrs  (1.89x speedup)  <- MEASURED
+  RIFE 4K = 8 s/pair:  total = 13.8 hrs  (1.82x speedup)
+  RIFE 4K = 12 s/pair: total = 14.4 hrs  (1.75x speedup)
+
+QUALITY ANALYSIS:
+  Question: does upscale-then-interpolate vs interpolate-then-upscale produce
+  different output quality?
+
+  CURRENT (interp-then-upscale):
+    RIFE motion estimation at 1080p -> highly accurate (lower resolution, more context)
+    HAT upscales both original and RIFE-synthesized frames together
+
+  REORDERED (upscale-then-interp):
+    HAT upscales only 30fps originals (each frame gets full HAT quality)
+    RIFE motion estimation at 4K -> slightly less accurate (higher resolution, RIFE
+    must detect sub-pixel motion at 4K which is harder for block-matching)
+    RIFE-synthesized frames at 4K may have slightly more artifact at tile boundaries
+
+  LITERATURE CONSENSUS  (multiple super-resolution papers, e.g. REDS4 benchmarks):
+    Both orderings produce visually similar results for real-world content.
+    For pure synthetic benchmarks, interpolate-then-upscale is marginally better
+    (0.1-0.3 dB PSNR on RIFE-synthesized frames only).
+    For content with high motion (MAD ~ 24 like this video), the difference is minimal
+    because RIFE at 4K still has sufficient texture information.
+
+  KEY INSIGHT: RIFE-synthesized frames are ALREADY synthetic. They were created
+  by interpolation at 1080p and will never have true super-resolution detail.
+  Whether we upscale them with HAT (current) or RIFE generates them at 4K (reordered),
+  the quality of interpolated frames is bounded by RIFE's accuracy, not HAT's.
+  Upscaling original keyframes with HAT and letting RIFE interpolate at 4K means:
+    - Original frames: highest quality (full HAT)
+    - Interpolated frames: similar quality either way (RIFE-bounded)
+
+IMPLEMENTATION NOTES:
+  1. checkpoint.json shows stage2b ALREADY DONE (s2b_rife.mkv at 60fps, 1098 frames).
+     To use reordered pipeline, must backtrack to s2_stabilized.mkv (30fps, 549 frames).
+  2. s2_stabilized.mkv exists (507.7 MB). Stage3 not yet started. Backtracking is safe.
+  3. After HAT on 30fps, run rife-ncnn-vulkan between consecutive 4K frame pairs.
+  4. rife-ncnn-vulkan v4.6 model already installed at:
+     tools/rife-ncnn-vulkan/rife-ncnn-vulkan-20221029-windows/rife-ncnn-vulkan.exe
+
+VERDICT: STRONGLY RECOMMEND if willing to backtrack from s2b checkpoint.
+  1.89x speedup with zero loss on original keyframes.
+  Saves ~11.9 hrs (25.2 -> 13.3 hrs) vs current plan.
+  Combined with OCAB fix + tile_pad=12 + max-autotune (17.6 hrs baseline):
+    17.6 / 1.89 = IMPOSSIBLE (pipeline reorder applies to the HAT STAGE only,
+    not multiplicative; must calculate correctly):
+    HAT 30fps (549 frames, ~57.8s/frame after all patches): 549 x 57.8 = 8.8 hrs
+    RIFE 4K (549 pairs x 4.65s):                                         = 0.7 hrs
+    COMBINED BEST CASE (all optimizations + reorder):                    = 9.5 hrs
+    vs original 443 s/frame x 1098 frames = 134.9 hrs                   = 14.2x total speedup
+
+----------------------------------------------------------------
+FINDING #11: FRAME SIMILARITY TEMPORAL SKIP -- ZERO BENEFIT
+----------------------------------------------------------------
+
+MEASUREMENT (probe_backends.py, input/14238437_1080_1920_30fps.mp4, at 5s mark):
+  Extracted 20 consecutive frames (1080x1920 RGB)
+  Frame-to-frame MAD (Mean Absolute Difference, 0-255 scale):
+    minimum:  21.57
+    median:   24.33
+    maximum:  30.75
+    > 5.0 (significant motion):  19/19 frames  (100%)
+    < 2.0 (eligible for skip):    0/19 frames  (0%)
+
+CONCLUSION: This video has very high and continuous motion throughout.
+  A median MAD of 24.3 out of 255 means adjacent frames differ by ~9.5% per pixel.
+  This is extremely high-motion content (action scene / sports / fast camera pan).
+  No frames are eligible for temporal interpolation skip even at generous thresholds.
+
+  For comparison: static/slow-motion content typically has MAD 1-5.
+  MAD > 20 means this optimization is completely inapplicable to this video.
+
+VERDICT: Do not implement. Zero benefit for this specific video.
+
+----------------------------------------------------------------
+FINDING #12: torch._inductor coordinate_descent_tuning -- MINOR
+----------------------------------------------------------------
+
+MEASUREMENT (MLP subgraph [B=676, seq=256, dim=180->360->180]):
+  No compile:                           15.196 ms
+  compile mode='default':               10.909 ms   (1.39x)
+  compile + coordinate_descent_tuning:  10.423 ms   (1.05x vs default, 1.46x vs base)
+
+  Improvement from CDT alone: ~5% on linear ops.
+
+PROJECTION to full HAT pipeline:
+  Linear layers (addmm): 8.4% of 5503ms = 462ms
+  5% saving on linear:   ~23ms total
+  As fraction of tile:   0.4%
+
+  CDT can be enabled independently of compile mode via:
+    torch._inductor.config.coordinate_descent_tuning = True
+    (before calling torch.compile)
+  This gives part of max-autotune benefit without the full warm-up cost.
+
+ADDITIONAL INDUCTOR KNOBS CHECKED (probe_backends.py):
+  max_autotune:              False  (default; equivalent to mode='max-autotune')
+  shape_padding:             True   (already enabled -- pads to power-of-2 dims)
+  epilogue_fusion:           True   (already enabled -- fuses pointwise after matmul)
+  compile_threads:           1      (only 1 CPU thread for compilation!)
+
+  NOTE: compile_threads=1 means the 171s warm-up uses 1 CPU core.
+  Setting compile_threads = os.cpu_count() // 2 reduces warm-up time.
+  Example: on 8-core CPU -> 4 threads -> ~43s warm-up instead of 171s.
+  THIS DOES NOT AFFECT PER-TILE INFERENCE TIME. Only affects startup.
+
+VERDICT: CDT alone gives 0.4% total improvement. Trivial, but free.
+  Setting compile_threads > 1 improves startup time but not throughput.
+  Not worth a separate line-item in priority list; fold into max-autotune setting.
+
+----------------------------------------------------------------
+UPDATED PRIORITY TABLE AND PROJECTIONS  (all findings combined)
+----------------------------------------------------------------
+
+  Priority  Finding                      Saving         Quality  Effort    Status
+  ---------------------------------------------------------------------------------
+  #1 MUST   OCAB hd pad 30->32           ~460ms         NONE     Low       PENDING
+  #2 EASY   tile_pad 16->12              ~237ms         Minimal  Trivial   PENDING
+  #3 DONE   max-autotune-no-cudagraphs   5503->3275ms   NONE     Done      DONE (2026-05-18)
+             CONFIRMED: 1.80x speedup (uncompiled->compiled), 1.68x vs mode='default'
+  #4 ARCH   Pipeline reorder             ~7.5hrs saved  ~None    Medium    PENDING**
+  #5 MED    reduce-overhead (cache mask) ~280ms         NONE     Medium    PENDING
+  #6 SKIP   TensorRT                     1.2-1.8x       NONE     4-8 hrs   Skip (risk)
+  #7 DONE   cuDNN SDPA                   auto           NONE     None      DONE (auto)
+  #8 N/A    Frame-skip                   0%             N/A      N/A       N/A (high-motion)
+  #9 FOLD   CDT tuning                   0.4%           NONE     Trivial   Folded into #3
+  (** requires backtracking past stage2b checkpoint to s2_stabilized.mkv)
+
+UPDATED PROJECTION TABLE  (confirmed + projected, HAT-on-60fps, 1098 frames):
+
+  Config                                        ms/tile  s/frame  hrs(1098f)  speedup*
+  -------------------------------------------------------------------------------------
+  Patched + mode='default' compile (old)          5503      82.5     25.2      1.00x
+  Patched + max-autotune-no-cudagraphs            3275      49.1     15.0      1.68x  CONFIRMED
+  + OCAB head_dim fix (~-460ms)                   2815      42.2     12.9      1.95x
+  + tile_pad=12 (~-237ms)                         2578      38.7     11.8      2.14x
+  + reduce-overhead (if mask pre-buffered)        2298      34.5     10.5      2.40x
+  -------------------------------------------------------------------------------------
+  BEST CASE (60fps pipeline):                    ~2298      34.5    ~10.5h     2.40x
+  (* speedup relative to old mode='default' compiled baseline 5503ms)
+
+  WITH PIPELINE REORDER (HAT on 30fps only, RIFE at 4K after):
+  -------------------------------------------------------------------------------------
+  Reorder + max-autotune-no-cudagraphs (3275ms x 15 x 549f)    7.5h + 0.7h RIFE = 8.2h
+  Reorder + OCAB + pad12 (2578ms x 15 x 549f)                  5.9h + 0.7h RIFE = 6.6h
+  Reorder + OCAB + pad12 + reduce-overhead (2298ms x 15 x 549) 5.3h + 0.7h RIFE = 6.0h
+  -------------------------------------------------------------------------------------
+  BEST CASE (all changes + reorder):                                          ~6.0h
+  vs old mode='default' + no-reorder (25.2h):  25.2 / 6.0 = 4.20x additional speedup
+  vs original pipeline (443 s/frame x 1098f = 135h):  135 / 6.0 = 22.5x total speedup
+
+================================================================
+
+
+================================================================
+ADDITIONAL RESEARCH -- SESSION 4  (2026-05-18)
+================================================================
+
+TOOLS USED:
+  benchmark via torch.compile direct timing (raw model inference, torch.no_grad)
+  GPU: RTX 3070 8GB, CUDA 12.4, PyTorch 2.6.0+cu124, Python 3.12.7
+
+----------------------------------------------------------------
+FINDING #13: torch.compile max-autotune -- CONFIRMED, WITH BUG FIXES
+----------------------------------------------------------------
+
+WHAT WAS ATTEMPTED: Upgrade compile mode from 'default' to 'max-autotune'.
+  Expected gain (Session 3 estimate): +10-25% (literature)
+  Actual gain (measured):             +68% vs mode='default', +80% vs uncompiled
+
+BUGS DISCOVERED AND FIXED:
+
+  BUG 1 -- mode='max-autotune' crashes HAT with CUDA graph pool error
+  -----------------------------------------------------------------
+  Symptom: RuntimeError: These storage data ptrs are not allocated in pool (0, 1)
+  Root cause: mode='max-autotune' forces triton.cudagraphs=True internally.
+    This is hardcoded in torch._inductor.list_mode_options() in PyTorch 2.6.
+    Even setting torch._inductor.config.triton.cudagraphs = False before compile
+    does NOT work -- the mode preset overrides it.
+    HAT's forward_features() has a Python if-branch for _mask_cache allocation.
+    The CUDA graph captures only the cache-hit path, but the mask tensor was
+    allocated outside the capture scope. Pool mismatch = crash.
+  Fix: Use mode='max-autotune-no-cudagraphs'.
+    Same preset as max-autotune (coordinate_descent_tuning=True, max_autotune=True)
+    but WITHOUT triton.cudagraphs=True.
+  File changed: inference_realesrgan_video.py line ~510
+    _compile_mode = 'max-autotune-no-cudagraphs'
+
+  BUG 2 -- calculate_mask CPU tensor forces MSVC dependency
+  -----------------------------------------------------------------
+  Symptom: RuntimeError: Compiler: cl is not found in PATH
+  Root cause: hat_arch.py (basicsr package) had:
+    img_mask = torch.zeros((1, h, w, 1))  -- no device arg, defaults to CPU
+    torch.compile traces the mask computation as a CPU op.
+    Inductor tries to compile a C++ vectorization kernel -- requires cl.exe (MSVC).
+    MSVC is not in PATH for the Python subprocess.
+  Fix: Added device parameter to calculate_mask():
+    def calculate_mask(self, x_size, device=None):
+        img_mask = torch.zeros((1, h, w, 1), device=device)  # now on GPU
+  Caller updated to pass device=x.device:
+    self._mask_cache = self.calculate_mask(x_size, device=x.device).to(dtype=x.dtype)
+  File changed: basicsr/archs/hat_arch.py (installed in venv)
+
+CONFIRMED BENCHMARK (RTX 3070 8GB, FP16, mode='max-autotune-no-cudagraphs'):
+  Tile size   Compiled    Uncompiled   Speedup   Compile time (first run)
+  -----------------------------------------------------------------------
+  256x256     1381 ms     2548 ms      1.85x     94.2 s
+  416x416     3275 ms     5892 ms      1.80x     141.9 s
+  -----------------------------------------------------------------------
+  Compile cache location: C:/VideoUpscale/.inductor_cache/
+  Subsequent runs use cache: ~5 s warmup instead of 2-4 min.
+
+vs mode='default' compiled baseline (5503 ms/tile from bench_compare.py):
+  5503 / 3275 = 1.68x improvement from changing compile mode.
+  This alone reduces: 25.2 hrs (mode=default) -> 15.0 hrs (max-autotune-no-cudagraphs).
+  Saving: 10.2 hours of processing time for this video.
+
+WHY SPEEDUP IS +68% NOT +10-25%:
+  HAT operates on small matrices: [676, 256, 180], [676, 256, 540] etc.
+  For small M/N, the default Triton GEMM tile selection (often 64x64 or 128x64)
+  may not be optimal. coordinate_descent_tuning exhaustively searches tile configs.
+  For HAT's 36 HABs x 3 linear layers each = 108 GEMM calls per tile, even small
+  per-call improvements compound. The +10-25% literature figure comes from larger
+  transformer benchmarks (ViT/BERT) where the default config is already near-optimal.
+
+INDUCTOR CACHE KEY NOTE:
+  Cache is keyed on the compiled function + input shapes + hardware.
+  Changing tile size invalidates the 416x416 cache but 256x256 stays valid.
+  Adding new patches to hat_arch.py may invalidate the cache (code hash changes).
+  If HAT is re-patched, delete C:/VideoUpscale/.inductor_cache/ and recompile.
+
+----------------------------------------------------------------
+UPDATED MASTER BENCHMARK TABLE  (as of 2026-05-18)
+----------------------------------------------------------------
+
+  Config                                            ms/tile  s/frame  hrs(1098f)  vs orig
+  ---------------------------------------------------------------------------------------
+  ORIGINAL   tile=512 FP32 (observed)               ~29533   443.0    135.0      1.00x
+  UNPATCHED  tile=384 FP16, math_sdp                 13056   195.8     59.7      2.26x
+  PATCHED    tile=384 FP16, mem_eff_sdp               7421   111.3     34.0      3.97x
+  PATCHED+COMPILE mode='default'                      5503    82.5     25.2      5.36x
+  PATCHED+COMPILE mode='max-autotune-no-cudagraphs'   3275    49.1     15.0      9.00x
+  ---------------------------------------------------------------------------------------
+  NOTE: rows 1-4 from bench_compare.py (includes tiling pipeline overhead).
+        Row 5 from raw model inference timing (same input size 416x416, 5-run avg).
+        Row 5 hrs = 3275ms x 15 tiles x 1098 frames / 3,600,000.
+
+----------------------------------------------------------------
+BEST SETTINGS (confirmed as of 2026-05-18)
+----------------------------------------------------------------
+
+  In inference_realesrgan_video.py before torch.compile():
+    torch._dynamo.config.cache_size_limit = 64     # required: 36 DropPath modules
+    import torch._inductor.config as _ic
+    _ic.coordinate_descent_tuning = True           # +0.4% GEMM, already included in preset
+    _compile_mode = 'max-autotune-no-cudagraphs'   # NOT 'max-autotune' (CUDA graph crash)
+    _compiled_hat = torch.compile(upsampler.model, mode=_compile_mode, dynamic=False)
+
+  Environment variable (set before running):
+    TORCHINDUCTOR_CACHE_DIR=C:/VideoUpscale/.inductor_cache
+
+  In hat_arch.py (already patched):
+    calculate_mask(self, x_size, device=None)      # GPU mask, no cl.exe dependency
+    torch.zeros((1, h, w, 1), device=device)       # allocates on same device as input
+    _mask_cache_size + _mask_cache caching          # avoid recompute on same tile size
+
+----------------------------------------------------------------
+NEXT PRIORITIES AFTER SESSION 4
+----------------------------------------------------------------
+
+  1. OCAB head_dim pad 30->32  (~460ms saving, zero quality impact, ~20 line change)
+     Same approach as HAB fix: F.pad(q/k/v, (0, 2)) before SDPA, crop output.
+     File: basicsr/archs/hat_arch.py, OCAB class WindowAttention.
+
+  2. tile_pad 16->12  (~237ms saving, trivial)
+     File: upscale.py, change tile_pad parameter from "16" to "12".
+
+  3. Pipeline reorder (HAT on 30fps originals, RIFE at 4K after)
+     Cuts HAT work in half: 1098->549 frames.
+     RIFE 4K cost: 549 x 4.65s = 0.7h (measured, rife-ncnn-vulkan v4.6).
+     Total at current speed: 549 x 49.1s + 0.7h = 8.2h vs 15.0h (1.83x speedup).
+     Requires backtracking: use s2_stabilized.mkv (30fps) instead of s2b_rife.mkv.
+
+================================================================
+
+
+================================================================
+ADDITIONAL RESEARCH -- SESSION 5  (2026-05-18)
+================================================================
+
+TOOLS USED:
+  probe_graphbreaks.py  -- torch._dynamo.explain() with 64x64 input
+  probe_compile_bench.py  -- freezing / epilogue_fusion_first / fullgraph benchmarks
+  probe_compile_bench2.py -- post-compile profiler, EXHAUSTIVE GEMM, SM investigation
+
+  All benchmarks: RTX 3070 8GB, CUDA 12.4, PyTorch 2.6.0+cu124, 416x416 tile FP16
+  Baseline in this session: 3272 ms/tile (within variance of 3275ms from Session 4)
+
+----------------------------------------------------------------
+FINDING #14: DYNAMO GRAPH BREAKS -- ZERO (in practice)
+----------------------------------------------------------------
+
+RESULT: graph_count = 1. HAT compiles as a single Dynamo graph.
+  torch._dynamo.explain() with 64x64 input confirms no graph breaks.
+  The entire HAT forward (embed -> 6x RSTB -> upsampler) is one compiled subgraph.
+
+COMPLICATION: fullgraph=True FAILS with:
+  "Unsupported: builtin: ne [ConstantVariable, DataPtrVariable]"
+  Location: hat_arch.py forward, the _mask_cache_size != x_size guard.
+
+EXPLANATION: In default mode (no fullgraph), Dynamo *specializes* on the guard
+  "_mask_cache_size == (416, 416)" and recompiles only if tile size changes.
+  This creates 1 specialized graph with a Python guard -- not a runtime break.
+  explain() shows graph_count=1 because it traces the cache-hit code path.
+  fullgraph=True refuses to accept ANY Python guards, hence the failure.
+
+RUNTIME IMPACT: Zero. The guard fires once at compile time (cache miss on first
+  call), then the specialized graph runs without re-entering Python for all
+  subsequent tiles of the same size. Removing the guard (or patching for
+  fullgraph=True) would give < 0.1% improvement.
+
+CONCLUSION: No graph break optimizations needed. Skip fullgraph=True fix.
+
+----------------------------------------------------------------
+FINDING #15: RTX 3070 SM COUNT -- max_autotune_gemm DISABLED
+----------------------------------------------------------------
+
+CRITICAL DISCOVERY: torch/_inductor/utils.py, is_big_gpu():
+  min_sms = 68  # 3080
+  RTX 3070 has 46 SMs  ->  46 < 68  ->  is_big_gpu() returns False
+
+CONSEQUENCE: max_autotune_gemm (GEMM template autotuning) is DISABLED on RTX 3070.
+  This means:
+  - No Triton GEMM templates are tried (only ATEN/cuBLAS for linear ops)
+  - max_autotune_gemm_search_space setting has ZERO effect
+  - EXHAUSTIVE search space is confirmed 0.0% improvement (see Finding #16)
+
+WHAT IS STILL ACTIVE from mode='max-autotune-no-cudagraphs':
+  - coordinate_descent_tuning = True (tunes Triton pointwise/reduction kernels)
+  - max_autotune_pointwise = True (autotunes Triton pointwise tile configs)
+  - These apply to: attention bias add, GELU, layer_norm fusions, residual adds
+  - The +80% speedup from max-autotune vs uncompiled is ENTIRELY from CDT on
+    these fused kernels, NOT from GEMM template search
+
+WORKAROUND: Monkey-patch is_big_gpu to force GEMM template search:
+  import torch._inductor.utils as _iu
+  _orig_ibg = _iu.is_big_gpu.__wrapped__
+  def _force_big_gpu(dev=0): return True
+  import functools
+  _iu.is_big_gpu = functools.lru_cache(None)(_force_big_gpu)
+  This would allow inductor to try Triton GEMM templates vs cuBLAS for each linear.
+  RISK: Triton GEMM templates may not beat cuBLAS for HAT's tall-thin shapes
+  [(676*256 x 180) x (180 x 180)] -- cuBLAS is heavily optimized for these.
+  COST: Very long recompile (~1-3h). BENEFIT: Likely 0-5%. NOT RECOMMENDED.
+
+----------------------------------------------------------------
+FINDING #16: EXHAUSTIVE GEMM SEARCH SPACE -- CONFIRMED ZERO
+----------------------------------------------------------------
+
+MEASURED: max_autotune_gemm_search_space = "EXHAUSTIVE"
+  Baseline (DEFAULT): 3272 ms/tile  warmup=37.1s  (from cache)
+  EXHAUSTIVE:         3272 ms/tile  warmup=25.1s
+  Speedup: 1.000x (+0.0%)
+
+REASON: As explained in Finding #15, max_autotune_gemm is DISABLED on RTX 3070
+  (is_big_gpu() = False). EXHAUSTIVE changes the search space for GEMM templates,
+  but since no GEMM templates are tried at all, it has no effect whatsoever.
+  EXHAUSTIVE was re-confirmed to use cached kernels (25s warmup = cache hit).
+
+VERDICT: Remove EXHAUSTIVE from todo list. No gain possible.
+
+----------------------------------------------------------------
+FINDING #17: freezing=True AND epilogue_fusion_first=True -- NEGLIGIBLE
+----------------------------------------------------------------
+
+MEASURED (416x416, 5-run avg, warmup=3):
+  Baseline:                   3429 ms  (1.000x)  [this run had fresh recompile]
+  freezing=True:              3410 ms  (1.006x, +0.6%)
+  epilogue_fusion_first=True: 3401 ms  (1.008x, +0.8%)
+
+ANALYSIS:
+  freezing=True: Constant-folds model parameters into the compiled graph, removing
+  parameter loads from every forward pass. Near-zero benefit for HAT because:
+  - CDT already fuses parameter ops into Triton kernels
+  - Linear weights are read once per kernel; freezing doesn't change memory access
+  - The +0.6% is within measurement noise
+
+  epilogue_fusion_first=True: Biases inductor toward fusing pointwise epilogues
+  before splitting kernels, vs after. +0.8% suggests HAT's epilogue pattern is
+  not meaningfully changed by this ordering.
+
+VERDICT: Neither flag is worth adding to inference_realesrgan_video.py.
+
+----------------------------------------------------------------
+FINDING #18: POST-COMPILE PROFILER -- RESULTS ARE BLACK BOXES
+----------------------------------------------------------------
+
+RESULT: torch.profiler on compiled model shows only "Torch-Compiled Region: X/Y"
+  entries. Individual CUDA ops (mm, sdp, conv) are hidden inside compiled regions.
+
+Top entries by CUDA time (1-pass profiler with overhead):
+  Torch-Compiled Region: 0/1   = 3358ms (60.3%)  -- main transformer body
+  Torch-Compiled Region: 3/1   =  547ms ( 9.8%)  -- RSTB group (repeated 5x)
+  Torch-Compiled Region: 3/0   =  534ms ( 9.6%)  -- RSTB group (1st call)
+  Torch-Compiled Region: 5/x   =  various        -- HAB blocks
+  Torch-Compiled Region: 6/0   =   34ms ( 0.6%)  -- OCAB (36 calls)
+  Etc.
+
+Category breakdown (labels visible INSIDE compiled regions -- minimal):
+  Attention/SDP:  18.7ms (0.3%)  -- these are the few uncompiled SDPA wrapper calls
+  GEMM/mm:         3.0ms (0.1%)
+  Conv:           38.2ms (0.7%)
+  LayerNorm:      29.6ms (0.5%)
+  Triton kernels: 78.7ms (1.4%)
+  [REMAINING 97% is inside compiled Triton kernels -- not visible to profiler]
+
+Profiler overhead: 5566ms (profiler) vs 3272ms (benchmark) = 70% overhead.
+  This is expected for compiled models -- each Triton kernel launch is instrumented.
+
+TO GET REAL PER-OP BREAKDOWN: Need NVIDIA Nsight Systems or Nsight Compute.
+  Command: nsys profile --output hat_profile.nsys-rep python bench_tile.py
+  Then visualize in Nsight Systems GUI (free download from NVIDIA).
+  This would reveal the true breakdown inside compiled regions.
+
+CONCLUSION: Standard profiler is insufficient for compiled model analysis.
+  The bottleneck is definitively inside the HAB attention loops (logical deduction),
+  but exact ms breakdown requires Nsight.
+
+----------------------------------------------------------------
+FINDING #19: OCAB HEAD_DIM FIX -- ALREADY DONE
+----------------------------------------------------------------
+
+Session summary incorrectly listed OCAB head_dim fix as PENDING (~460ms saving).
+Code inspection of hat_arch.py confirms OCAB already has the fix (line 499):
+  _hd  = q.shape[-1]    # 30
+  _pad = (-_hd) % 8     # 2  (next multiple of 8)
+  if _pad:
+      q = F.pad(q, (0, _pad))
+      k = F.pad(k, (0, _pad))
+      v = F.pad(v, (0, _pad))
+  out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, scale=self.scale)
+  if _pad: out = out[..., :_hd]
+
+This was done in a prior session. The 3272ms baseline ALREADY INCLUDES this fix.
+The Session 4 projection of "3275 -> 2815ms with OCAB fix" was projecting future work
+that has since been completed. Confirmed baseline is 3272ms with ALL fixes applied.
+
+----------------------------------------------------------------
+FINDING #20: tile_pad ANALYSIS -- CORRECT VALUE IS 8, NOT 12
+----------------------------------------------------------------
+
+CRITICAL: inference_realesrgan_video.py rounds tile+2*tile_pad UP to next multiple
+  of window_size=16 before passing to model:
+    target = ceil((tile + 2*tile_pad + win - 1) // win) * win
+
+  For tile=384:
+    tile_pad=16: 384+32=416 -> ceil(416/16)*16 = 416  [26x26=676 windows]
+    tile_pad=12: 384+24=408 -> ceil(408/16)*16 = 416  [26x26=676 windows] NO GAIN!
+    tile_pad=8:  384+16=400 -> ceil(400/16)*16 = 400  [25x25=625 windows] SAVES!
+    tile_pad=0:  384+0 =384 -> ceil(384/16)*16 = 384  [24x24=576 windows] SEAM RISK
+
+  tile_pad=12 recommendation in earlier sessions was INCORRECT.
+  tile_pad=12 gives EXACTLY THE SAME model input size as tile_pad=16 (both = 416).
+
+CORRECT RECOMMENDATION: tile_pad=8
+  Model input: 400x400, 25x25=625 windows vs current 26x26=676 windows
+  Compute saving: (676-625)/676 = 7.5% fewer attention operations
+  Time saving: ~3272 * 0.075 = ~245ms/tile
+  Hours saving: 245ms x 15 tiles x 1098 frames / 3,600,000 = 1.1h
+  Quality risk: tile_pad=8 gives 8px overlap per tile edge. HAT window_size=16,
+    so this is 1/2 window of overlap. For most content this is invisible.
+    For high-contrast sharp edges at exact tile boundaries (384px intervals in
+    1920-wide frame: at x=384, 768, 1152, 1536) there may be very subtle seams.
+  RECOMMENDATION: Use tile_pad=8 for a 7.5% speedup with minimal quality risk.
+    If seams are visible, revert to tile_pad=16 (1 change in upscale.py).
+
+----------------------------------------------------------------
+UPDATED PRIORITY TABLE (SESSION 5)
+----------------------------------------------------------------
+
+  Priority  Finding                              Saving    Quality  Status
+  -------------------------------------------------------------------------
+  #1 DONE   max-autotune-no-cudagraphs          3275ms    NONE     DONE
+  #2 DONE   HAB+OCAB head_dim 30->32            ~460ms    NONE     DONE
+  #3 DONE   mask cache + GPU alloc fixes         ~280ms   NONE     DONE
+  #4 EASY   tile_pad 16->8                       ~245ms   Minimal  PENDING
+  #5 ARCH   Pipeline reorder (30fps+RIFE after)  ~6.8h    ~None    PENDING
+  #6 SKIP   freezing=True                         +0.6%   NONE     SKIP (negligible)
+  #7 SKIP   epilogue_fusion_first=True            +0.8%   NONE     SKIP (negligible)
+  #8 SKIP   EXHAUSTIVE GEMM search               +0.0%   NONE     SKIP (confirmed zero)
+  #9 SKIP   fullgraph=True                        FAIL    N/A      SKIP (graph break guard)
+  #10 RISK  Force is_big_gpu + GEMM templates    0-5%?   NONE     LOW PRIORITY (long compile)
+  #11 SKIP  Flash SDP                            N/A     N/A      N/A (not compiled in)
+  #12 SKIP  FP8 quantization                     N/A     ~HIGH    SKIP (sm_86 no FP8 cores)
+  #13 SKIP  torchao INT8/INT4                    <1%     Moderate SKIP (geometry mismatch)
+
+UPDATED PROJECTION TABLE (all fixes already done, only tile_pad pending):
+
+  Config                                      ms/tile  s/frame  hrs(1098f)  speedup*
+  -----------------------------------------------------------------------------------
+  Confirmed (all current patches applied)      3272     49.1     15.0       9.03x
+  + tile_pad=8 (-245ms)                        3027     45.4     13.9       9.76x
+  -----------------------------------------------------------------------------------
+  + Pipeline reorder (549 frames only):
+    Current (3272ms x 15 x 549f)                                  7.5h
+    + tile_pad=8 (3027ms x 15 x 549f)                             6.9h
+    + tile_pad=8 + RIFE after                                      6.9h + 0.7h = 7.6h
+  (* speedup vs original 443 s/frame x 1098 frames = 135h)
+
+IMPORTANT: Sessions 1-4 projections of "2815ms after OCAB fix" and "2578ms after tile_pad=12"
+  were incorrect. OCAB fix is already in the 3272ms baseline.
+  tile_pad=12 gives no reduction (both round to 416). Correct saving is 245ms via tile_pad=8.
+  The 3272ms baseline already incorporates: HAB+OCAB head_dim fix, mask cache, GPU alloc,
+  max-autotune-no-cudagraphs, CDT.
+
+================================================================

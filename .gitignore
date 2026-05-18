@@ -1,0 +1,50 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Torch compile caches (machine-specific, large)
+.inductor_cache/
+.torch_compile_cache/
+
+# Large model weights (download separately)
+models/
+tools/Real-ESRGAN/experiments/
+tools/Real-ESRGAN/weights/
+tools/RIFE/train_log/
+tools/Real-ESRGAN/realesrgan.egg-info/
+
+# Binary tools (large, platform-specific)
+tools/ffmpeg/
+tools/rife-ncnn-vulkan/
+tools/rife-ncnn-vulkan-20221029-windows/
+
+# Tool subdirs with their own git repos (clone separately on each machine)
+tools/CodeFormer/
+tools/HAT/
+tools/RIFE/
+tools/Real-ESRGAN/
+tools/STAR/
+
+# Binary model exports
+tools/*.onnx
+
+# Video I/O
+input/
+output/
+temp/
+
+# Credentials / secrets
+gpuhub_pod.txt
+runpod-ssh.txt
+
+# Logs
+upscale_log.txt
+*.log
+
+# OS
+Thumbs.db
+.DS_Store

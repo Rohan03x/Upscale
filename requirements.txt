@@ -1,0 +1,101 @@
+# ============================================================
+# VideoUpscale Pipeline — Python dependencies
+# Install: pip install -r requirements.txt
+# Torch must be installed first with the correct CUDA version:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# ============================================================
+
+# --- Core ML (install separately with CUDA index URL above) ---
+# torch>=2.0.0
+# torchvision>=0.15.0
+# torchaudio>=2.0.0
+
+# --- Real-ESRGAN + EDVR (basicsr) ---
+# NOTE: basicsr 1.4.2 (PyPI) does NOT ship nafnet_arch.
+#       NAFNet is embedded inline in tools/nafnet_deblur.py — no extra install needed.
+basicsr>=1.4.2
+realesrgan
+facexlib
+gfpgan
+
+# --- NAFNet blind deblur (stage 1.5) --- model download ~69 MB ---
+# python -m gdown 1Fr2QadtDCEXg6iwWX8OzeZLbHOx2t5Bj -O models/NAFNet-GoPro-width32.pth
+
+# --- EDVR temporal restoration (stage 1.6) --- model download ~95 MB ---
+# python -m gdown 1_ma2tgHscZtkIY2tEJkVdU-UP8bnqBRE -O models/EDVR-deblur.pth
+# Architecture: EDVR_L_deblur_REDS (num_feat=128, num_reconstruct_block=40, hr_in=True, with_predeblur=True)
+
+# --- HAT architecture (required for default model Real_HAT_GAN_SRx4_sharper) ---
+# git clone https://github.com/XPixelGroup/HAT tools/HAT
+# Windows: copy tools\HAT\hat\archs\hat_arch.py venv\Lib\site-packages\basicsr\archs\hat_arch.py
+# Linux:   BDIR=$(python -c "import basicsr,os;print(os.path.dirname(basicsr.__file__))") && cp tools/HAT/hat/archs/hat_arch.py $BDIR/archs/hat_arch.py
+# Dependencies: einops (already listed below), no extra packages needed
+
+# --- STAR video diffusion SR ---
+transformers>=4.35.0
+diffusers>=0.24.0
+accelerate>=0.24.0
+omegaconf>=2.3.0
+safetensors>=0.4.0
+
+# --- CodeFormer face restoration ---
+# git clone https://github.com/sczhou/CodeFormer tools/CodeFormer
+# cd tools/CodeFormer && pip install -r requirements.txt
+# python basicsr/setup.py develop
+# python scripts/download_pretrained_models.py facelib
+# python scripts/download_pretrained_models.py CodeFormer
+
+# --- RIFE frame interpolation ---
+skvideo
+moviepy>=1.0.3
+
+# --- Video I/O ---
+ffmpeg-python>=0.2.0
+imageio>=2.9.0
+imageio-ffmpeg>=0.4.0
+opencv-python-headless>=4.7.0
+
+# --- General utilities ---
+Pillow>=9.0.0
+numpy>=1.23.0
+scipy>=1.9.0
+scikit-image>=0.19.0
+tqdm>=4.65.0
+pyyaml>=6.0
+addict>=2.4.0
+future>=0.18.0
+requests>=2.28.0
+lmdb>=1.3.0
+einops>=0.6.0
+yapf>=0.32.0
+
+# --- Model download utility ---
+gdown>=4.7.0
+huggingface-hub>=0.19.0
+
+# ============================================================
+# RTX 5090 (Blackwell sm_120) setup — run these AFTER the
+# standard torch install above (cu128 build required).
+# ============================================================
+#
+# 1. Upgrade PyTorch to cu128 (full Blackwell sm_120 + FP8 native):
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+#
+# 2. Install the packages below:
+#    pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
+#
+# triton-windows  — enables torch.compile on Windows (NAFNet/EDVR/HAT).
+#   IMPORTANT: pin to 3.2.x for PyTorch 2.6.x (cu124/cu128).
+#   3.3+ through 3.7+ are API-incompatible with torch 2.6 (AttrsDescriptor moved).
+#   3.7.x additionally breaks CUDA Graphs (reduce-overhead / max-autotune).
+#   Current install: 3.2.0.post18  — compile modes: default / max-autotune-no-cudagraphs
+triton-windows==3.2.0.post18
+#
+# torchao         — FP8 dynamic quantisation for HAT/NAFNet on Blackwell (~2x speedup).
+#                   Usage: model = torchao.quantization.quantize_(model, Float8DynamicActivationFloat8WeightConfig())
+torchao>=0.7.0
+#
+# NOTE — no-tile run on 5090 (32 GB VRAM handles full 1920x1080 HAT pass):
+#   python upscale.py "input\video.mp4" --model Real_HAT_GAN_SRx4_sharper --scale 4 --tile 0
+# On 3070 (8 GB) keep --tile 512 to avoid OOM.
+# ============================================================
