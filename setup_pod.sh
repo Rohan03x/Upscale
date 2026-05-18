@@ -62,6 +62,9 @@ if [ ! -d "$TOOLS/RIFE/.git" ]; then
 else
   echo "  RIFE already cloned"
 fi
+# Apply torch.compile patch to RIFE inference_video.py
+cp $REPO/patches/rife_inference_video.py $TOOLS/RIFE/inference_video.py
+echo "  RIFE torch.compile patch applied"
 
 # HAT (architecture files)
 if [ ! -d "$TOOLS/HAT/.git" ]; then
