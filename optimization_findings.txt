@@ -1043,3 +1043,115 @@ IMPORTANT: Sessions 1-4 projections of "2815ms after OCAB fix" and "2578ms after
   max-autotune-no-cudagraphs, CDT.
 
 ================================================================
+
+
+================================================================
+ADDITIONAL RESEARCH -- SESSION 6  (2026-05-18)
+================================================================
+
+GPU: RTX 5090 (Blackwell sm_120), 31.36 GiB VRAM, driver 580.76.05
+     Intel Xeon Platinum 8470Q, 208 cores (pod)
+PyTorch: 2.8.0+cu128, CUDA 12.8, Python 3.12
+SSH: ssh -p 46978 root@connect.singapore-a.gpuhub.com
+Conda: /root/miniconda3, base env
+Pod repo: /root/Upscale/, branch main, git remote github.com/Rohan03x/Upscale.git
+TORCHINDUCTOR_CACHE_DIR: /root/autodl-tmp/inductor_cache/
+Test clip: /root/Upscale/input/test_clip.mp4  (18.3s, 30fps, 549 frames, 1080x1920)
+
+PRIOR RTX 5090 BASELINE (from Session 5, bench_opt4):
+  Config: reduce-overhead + TILE_BATCH=3 + FP8 + inductor + cudnn
+  Result: 6.97 s/frame steady-state (GPU bottleneck confirmed, not IO)
+  Note: RTX 5090 (Blackwell FP8 native) has DIFFERENT profile from RTX 3070.
+        All Session 1-5 ms/tile numbers were measured on RTX 3070.
+        On RTX 5090: outscale 4->2 default, FP8 dynamic quant, cuDNN FA3 active.
+
+BUGS FIXED THIS SESSION:
+  BUG: hat_arch.py @ARCH_REGISTRY.register() double-registration crash
+  Symptom: AssertionError "HAT already registered in arch registry"
+  Root cause: basicsr/archs/__init__.py auto-imports ALL basicsr arch files
+    (including basicsr's own hat_arch.py) when ANY basicsr.archs.* is imported.
+    This registers HAT. Then realesrgan/archs/__init__.py also imports our patched
+    hat_arch.py and tries to register HAT again -> AssertionError.
+  Fix 1 (inference_realesrgan_video.py): Change HAT instantiation from
+    "from basicsr.archs.hat_arch import HAT" to "from realesrgan.archs.hat_arch import HAT"
+    (uses already-imported patched version, avoids triggering basicsr's hat_arch again)
+  Fix 2 (hat_arch.py): Add before @ARCH_REGISTRY.register():
+    "ARCH_REGISTRY._obj_map.pop('HAT', None)"
+    Forces our patched HAT to be THE registered version even if basicsr registered first.
+  Files changed: patches/inference_realesrgan_video.py, patches/hat_arch.py
+  Git commits: a82b8d6, dd3bc92
+
+CHANGES DEPLOYED THIS SESSION:
+  1. inference_realesrgan_video.py: torch.compile mode changed to max-autotune-no-cudagraphs
+  2. inference_realesrgan_video.py: TILE_BATCH=4 probe added (after B=3 probe)
+  3. inference_realesrgan_video.py: --compile-mode CLI arg (choices: reduce-overhead,
+     max-autotune-no-cudagraphs, max-autotune, default, eager)
+  4. inference_realesrgan_video.py: --fullgraph CLI flag
+  5. inference_realesrgan_video.py: --pre-downscale CLI arg (e.g. 1.5 = 1080p->720p)
+  6. hat_arch.py: ARCH_REGISTRY double-registration fix
+
+----------------------------------------------------------------
+BENCH SERIES: RTX 5090 SYSTEMATIC OPTIMIZATION TRIAL
+----------------------------------------------------------------
+
+CHECKLIST (update as results come in):
+
+  #  Name           Config                              Status         s/frame  vs 6.97s
+  ------------------------------------------------------------------------------------------
+  B0 baseline       reduce-overhead, B=3, FP8           DONE           6.97     1.00x
+  B1 bench_autotune max-autotune-no-cudagraphs, B=3*    RUNNING (23f)  ~6.66*   ~1.047x*
+  B2 bench_reduce   reduce-overhead, B=auto             PENDING        TBD      TBD
+  B3 bench_fullgraph max-autotune + fullgraph=True      PENDING        TBD      TBD
+  B4 bench_720p     max-autotune + pre_downscale=1.5    PENDING        TBD      TBD
+  B5 bench_trt      torch_tensorrt 2.8.0+cu128 (FP16)  PENDING        TBD      TBD
+  * = preliminary measurement (23/550 frames), may vary at full run
+  TILE_BATCH=4 probe: OOM confirmed on RTX 5090 (31.36 GB) — ceiling is B=3
+
+  - TILE_BATCH=4 probe: OOM on RTX 5090 31.36 GB at tile=512 — B=3 is the ceiling
+  - TILE_BATCH=4 probe runs automatically (probe after B=3 passes)
+  - FP8 dynamic quantization auto-applies on Blackwell (sm_120)
+  - Inductor cache at /root/autodl-tmp/inductor_cache/ (warm after B1 first pass)
+    max-autotune-no-cudagraphs cache built during B1 first run (10-30 min compile)
+    second B1 restart used warm cache — warmup was FAST (seconds, not minutes)
+  - B3 (fullgraph=True) may fail -- _mask_cache size guard breaks fullgraph
+  - B4 (720p downscale): quality tradeoff. Note SSIM/PSNR delta if measurable.
+  - TRT: torch_tensorrt 2.8.0+cu128 installing (matches torch 2.8.0, no torch upgrade)
+    tensorrt-cu12-bindings + tensorrt-cu12-libs 10.16.1.11 also installing
+
+BUG FIXED: NVENC probe (git 1c3fde9)
+  Old: checked if "hevc_nvenc" in `ffmpeg -encoders` output
+  New: runs actual 1-frame null encode test via lavfi
+  Root cause: container lists hevc_nvenc but driver blocks it at runtime
+  Effect: Writer was crashing on frame 2-3 of every bench run
+  Fix: probe does functional test; if fails → falls back to libx264
+
+CHANGES ADDED (this session, beyond session notes):
+  7. inference_realesrgan_video.py: --compile-backend tensorrt/inductor CLI arg
+     Enables torch.compile(backend='tensorrt') for TRT FP16 engine path
+  8. bench_trt.sh: created and deployed to pod
+
+----------------------------------------------------------------
+B1 BENCH STATUS: max-autotune-no-cudagraphs (RUNNING — 2nd attempt, warm cache)
+----------------------------------------------------------------
+
+  Started: 2026-05-18 ~17:13 UTC (2nd start; 1st attempt crashed on writer bug)
+  Screen: 170181.bench_autotune
+  Triton cache: WARM (from 1st attempt — warmup took seconds, not 10-30 min)
+  TILE_BATCH: B=3 (B=4 OOM confirmed)
+  Writer: libx264 (NVENC probe fix confirmed working)
+
+  PRELIMINARY RESULT (frame 23/550):
+    s/frame = 6.66  (6.97 baseline → 4.7% speedup)
+    tqdm: inference:   4%|▍  | 23/550 [02:32<58:30, 6.66s/frame]
+
+  KEY AUTOTUNE FINDINGS (from first run AUTOTUNE logs):
+    convolution(4×180×544×544): Triton 1.596ms vs cuDNN 3.085ms → 1.93× OP speedup
+    convolution(4×60×544×544):  Triton 1.758ms vs cuDNN 2.484ms → 1.41× OP speedup
+    mm(1183744×180, 180×180):   Triton 0.696ms vs cuDNN 0.780ms → 1.12× OP speedup
+    conv(1×64×1088×1088):       cuDNN wins (1.498ms vs Triton 1.620ms) — cuDNN better for large spatial
+  
+  Overall wall-clock impact: +4.7% speedup (per-op gains partially offset by overhead)
+  Expected full-run result: 6.5–6.8 s/frame
+
+================================================================
+
