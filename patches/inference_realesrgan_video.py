@@ -608,15 +608,21 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                 return upsampler.model(inp)
 
             # Second call with same batch size: capture CUDA Graph
-            if _cg is None or _cg_batch != inp.shape[0]:
+            if _cg is None or (_cg is not False and _cg_batch != inp.shape[0]):
                 _cg_batch = inp.shape[0]
                 _cg_inp = inp.clone()
-                # Warm-up pass inside graph capture context
-                _cg = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(_cg):
-                    _cg_out = upsampler.model(_cg_inp)
-                torch.cuda.synchronize(upsampler.device)
-                print(f"  Upscale: CUDA Graph captured (batch={_cg_batch})", flush=True)
+                try:
+                    _cg = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(_cg):
+                        _cg_out = upsampler.model(_cg_inp)
+                    torch.cuda.synchronize(upsampler.device)
+                    print(f"  Upscale: CUDA Graph captured (batch={_cg_batch})", flush=True)
+                except Exception as _cg_err:
+                    print(f"  Upscale: CUDA Graph capture failed ({_cg_err}), using eager", flush=True)
+                    _cg = False  # sentinel: skip capture on future calls
+
+            if _cg is False:
+                return upsampler.model(inp)
 
             # Replay graph: just copy data and re-use the captured kernel stream
             _cg_inp.copy_(inp)
