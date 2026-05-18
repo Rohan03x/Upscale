@@ -813,6 +813,12 @@ class Upsample(nn.Sequential):
         super(Upsample, self).__init__(*m)
 
 
+# basicsr/archs/__init__.py auto-imports ALL arch files (including its own hat_arch.py)
+# when ANY basicsr.archs.* is first imported, registering HAT before we get here.
+# Pop it so our patched version re-registers cleanly and is the live class used.
+ARCH_REGISTRY._obj_map.pop('HAT', None)
+
+
 @ARCH_REGISTRY.register()
 class HAT(nn.Module):
     r""" Hybrid Attention Transformer
