@@ -47,7 +47,9 @@ class _PaddedTileModel:
         ph = self.target_h - h   # ≥0; 0 for full-size interior tiles
         pw = self.target_w - w
         if ph > 0 or pw > 0:
-            x = _F.pad(x, (0, pw, 0, ph), mode='reflect')
+            # reflect requires pad < input_dim; fall back to replicate for tiny edge tiles
+            _pad_mode = 'reflect' if (ph < h and pw < w) else 'replicate'
+            x = _F.pad(x, (0, pw, 0, ph), mode=_pad_mode)
         out = self.model(x)
         if ph > 0 or pw > 0:
             out = out[:, :, : h * self.scale, : w * self.scale]
@@ -573,7 +575,9 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                             h_r, w_r = raw.shape[-2], raw.shape[-1]
                             ph, pw = t_h - h_r, t_w - w_r
                             if ph > 0 or pw > 0:
-                                raw = _Ftb.pad(raw, (0, pw, 0, ph), 'reflect')
+                                # reflect requires pad < dim; fall back to replicate for tiny tiles
+                                _pad_mode = 'reflect' if (ph < h_r and pw < w_r) else 'replicate'
+                                raw = _Ftb.pad(raw, (0, pw, 0, ph), _pad_mode)
                             tiles.append(raw)
                             placements.append((
                                 isy * tile_scale, iey * tile_scale,
