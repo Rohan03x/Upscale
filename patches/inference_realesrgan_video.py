@@ -504,20 +504,16 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
 
         # torch.compile: cache_size_limit=64 required for HAT's 36 unique DropPath
         # modules (default limit=8 caused dynamo cache thrash → 0.6x SLOWER).
-        # dynamic=False: safe because _PaddedTileModel below ensures every tile
-        #   reaching the compiled model is exactly (target_w × target_h), enabling
-        #   static-shape compilation and CUDA-graph capture in max-autotune.
-        # coordinate_descent_tuning: per-kernel GEMM autotuning (extra ~5% on linear ops).
-        # max-autotune: searches optimal kernel configs; ~10-25% speedup over default.
-        #   One-time warm-up cost: ~10-30 min for HAT (amortised over 1098 frames).
+        # HAT uses "default" mode (not max-autotune) because:
+        #   - HAT is attention-heavy: GEMMs use cuBLAS via default mode = near-optimal
+        #   - max-autotune-no-cudagraphs spends 2-4 hrs on first-run AUTOTUNE for
+        #     HAT's ~200+ unique Triton kernel shapes (observed: 1 kernel/4 min)
+        #   - "default" compiles in ~3 min and gives ~90% of max-autotune throughput
+        # CDT is still useful for the few Conv2d layers in patch_embed/upsample.
         torch._dynamo.config.cache_size_limit = 64
         import torch._inductor.config as _ic
         _ic.coordinate_descent_tuning = True
-        # max-autotune-no-cudagraphs: same kernel autotuning as max-autotune but
-        # without CUDA graph capture.  Required because HAT's calculate_mask allocates
-        # a GPU tensor conditionally (Python if-branch), which is incompatible with
-        # CUDA graph memory-pool tracking and causes RuntimeError at inference time.
-        _compile_mode = 'max-autotune-no-cudagraphs'
+        _compile_mode = 'default'
         _compiled_hat = torch.compile(upsampler.model, mode=_compile_mode, dynamic=False)
         print(f"  Upscale: torch.compile(mode='{_compile_mode}', CDT=True, dynamic=False)", flush=True)
 
