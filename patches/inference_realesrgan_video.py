@@ -605,12 +605,16 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                         inp = torch.cat(chunk, dim=0)  # [N, C, t_h, t_w]
                         try:
                             with torch.no_grad():
+                                torch.compiler.cudagraph_mark_step_begin()
                                 outs = inner_model(inp)  # [N, C, t_h*scale, t_w*scale]
                         except RuntimeError as _e:
                             print(f'  Tile batch OOM (N={len(chunk)}): {_e}; '
                                   f'falling back to N=1', flush=True)
-                            outs = torch.cat(
-                                [inner_model(t) for t in chunk], dim=0)
+                            outs_list = []
+                            for t in chunk:
+                                torch.compiler.cudagraph_mark_step_begin()
+                                outs_list.append(inner_model(t))
+                            outs = torch.cat(outs_list, dim=0)
                         for j, (osy, oey, osx, oex, ostx, oetx, osty, oety) in enumerate(places):
                             self.output[:, :, osy:oey, osx:oex] = \
                                 outs[j:j+1, :, osty:oety, ostx:oetx]
@@ -636,12 +640,14 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                                   device=device, dtype=torch.float16)
                 with torch.no_grad():
                     for _ in range(3):
+                        torch.compiler.cudagraph_mark_step_begin()
                         _compiled_hat(_wup)
                 if _TILE_BATCH > 1:
                     _wup1 = torch.rand(1, 3, _target, _target,
                                        device=device, dtype=torch.float16)
                     with torch.no_grad():
                         for _ in range(3):
+                            torch.compiler.cudagraph_mark_step_begin()
                             _compiled_hat(_wup1)
                     del _wup1
                 torch.cuda.synchronize()
