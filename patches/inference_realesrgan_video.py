@@ -4,9 +4,11 @@ import glob
 import mimetypes
 import numpy as np
 import os
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 import torch
 import torch.nn.functional as _F
 from basicsr.archs.rrdbnet_arch import RRDBNet
@@ -284,8 +286,8 @@ class Writer:
         _over_4k = (out_width * out_height) > (3840 * 2160)
         use_nvenc = (not _over_4k) and _probe_nvenc(args.ffmpeg_bin)
         if _over_4k:
-            print(f'  Writer: >4K output ({out_width}x{out_height}), using libx264 (CPU) '
-                  f'to avoid VRAM contention with upscaler', flush=True)
+            print(f'  Writer: >4K output ({out_width}x{out_height}), lossless ultrafast '
+                  f'intermediate (CPU x264 qp=0)', flush=True)
         if use_nvenc:
             # CQ 18 = high-quality intermediate (re-encoded to CQ 14 in final stage).
             # -preset p4 = balanced quality/speed; p6/p7 are slower with minimal gain
@@ -295,6 +297,16 @@ class Writer:
                 preset="p4",
                 rc="vbr",
                 cq=18,
+                pix_fmt="yuv420p",
+                loglevel="error",
+            )
+        elif _over_4k:
+            # Intermediate >4K: lossless ultrafast — zero quality loss in pipeline,
+            # ~5x faster than medium; file is re-encoded to final quality by upscale.py.
+            vcodec_kwargs = dict(
+                vcodec="libx264",
+                preset="ultrafast",
+                crf=0,
                 pix_fmt="yuv420p",
                 loglevel="error",
             )
@@ -322,14 +334,36 @@ class Writer:
                 .overwrite_output()
                 .run_async(pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
 
-    def write_frame(self, frame):
-        frame = frame.astype(np.uint8).tobytes()
+        # Async encoder queue: GPU inference puts frames here and continues
+        # immediately; a background thread feeds the x264 pipe in parallel.
+        # Queue depth of 8 frames gives ~0.7 s headroom at 12 fps before stalling.
+        self._enc_error: Exception | None = None
+        self._enc_queue: queue.Queue = queue.Queue(maxsize=8)
+        self._enc_thread = threading.Thread(target=self._encode_loop, daemon=True)
+        self._enc_thread.start()
+
+    def _encode_loop(self):
         try:
-            self.stream_writer.stdin.write(frame)
+            while True:
+                item = self._enc_queue.get()
+                if item is None:  # sentinel — close() signals done
+                    break
+                self.stream_writer.stdin.write(item)
         except (BrokenPipeError, OSError) as e:
-            raise RuntimeError(f"Writer pipe broken (encoder crashed?): {e}") from e
+            self._enc_error = RuntimeError(f"Writer pipe broken (encoder crashed?): {e}")
+
+    def write_frame(self, frame):
+        if self._enc_error is not None:
+            raise self._enc_error
+        self._enc_queue.put(frame.astype(np.uint8).tobytes())  # blocks only when queue full
 
     def close(self):
+        if self._enc_error is not None:
+            raise self._enc_error
+        self._enc_queue.put(None)   # sentinel: tell encoder thread to exit
+        self._enc_thread.join()     # wait for all frames to be written
+        if self._enc_error is not None:
+            raise self._enc_error
         self.stream_writer.stdin.close()
         self.stream_writer.wait()
 
