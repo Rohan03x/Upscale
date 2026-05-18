@@ -640,14 +640,12 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                                   device=device, dtype=torch.float16)
                 with torch.no_grad():
                     for _ in range(3):
-                        torch.compiler.cudagraph_mark_step_begin()
                         _compiled_hat(_wup)
                 if _TILE_BATCH > 1:
                     _wup1 = torch.rand(1, 3, _target, _target,
                                        device=device, dtype=torch.float16)
                     with torch.no_grad():
                         for _ in range(3):
-                            torch.compiler.cudagraph_mark_step_begin()
                             _compiled_hat(_wup1)
                     del _wup1
                 torch.cuda.synchronize()
