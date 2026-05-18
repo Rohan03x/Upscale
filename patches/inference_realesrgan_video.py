@@ -524,17 +524,25 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
     print(f"  Upscale: UPSCALE_BATCH={UPSCALE_BATCH} ({_uvram:.0f} GB VRAM detected)", flush=True)
 
     if _ort_inferencer is None:
+        # Read compile backend early — needed to gate torchao quantization below.
+        # TRT manages precision internally; torchao FP8/INT8 ops create custom scale
+        # multiplications (e.g. mul_16) that TRT cannot lower to any TRT kernel, causing
+        # full subgraph fallback and OOM during tactic search. Skip both for TRT.
+        _cbackend_early = getattr(args, 'compile_backend', 'inductor')
+
         # FP8 dynamic quantisation for Blackwell (sm_120+) only.
         # HAT attention precision is more sensitive than conv models; restrict to Blackwell
         # where MX-FP8 Tensor Cores give genuine 2x throughput over FP16.
         _cc2 = torch.cuda.get_device_properties(0) if torch.cuda.is_available() else None
-        if _cc2 and _cc2.major >= 12:
+        if _cc2 and _cc2.major >= 12 and _cbackend_early != 'tensorrt':
             try:
                 from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig
                 quantize_(upsampler.model, Float8DynamicActivationFloat8WeightConfig())
                 print(f"  Upscale: FP8 quantisation applied (Blackwell sm_{_cc2.major}{_cc2.minor})", flush=True)
             except Exception as _fp8e:
                 print(f"  Upscale: FP8 unavailable \u2014 {type(_fp8e).__name__} (install torchao)", flush=True)
+        elif _cbackend_early == 'tensorrt':
+            print("  Upscale: FP8/INT8 skipped (TRT backend — precision managed by TRT FP16)", flush=True)
 
         # Ensure model.mean is on CUDA with correct dtype BEFORE compile.
         # mean is a plain tensor (not register_buffer), so model.half() skips it.
@@ -546,12 +554,14 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         # INT8 weight-only quantization via torchao (sm_86+: RTX 3070 compatible).
         # Converts Conv2d/Linear weight tensors to int8 scales; activations stay fp16.
         # Speedup is modest (~0.9% on HAT's mostly-attention workload) but zero quality loss.
-        try:
-            from torchao.quantization import quantize_, int8_weight_only
-            quantize_(upsampler.model, int8_weight_only())
-            print("  Upscale: INT8 weight-only quantization applied (torchao)", flush=True)
-        except Exception as _int8e:
-            print(f"  Upscale: INT8 skipped - {_int8e}", flush=True)
+        # Skipped for TRT backend (same reason as FP8 — TRT cannot lower torchao scale ops).
+        if _cbackend_early != 'tensorrt':
+            try:
+                from torchao.quantization import quantize_, int8_weight_only
+                quantize_(upsampler.model, int8_weight_only())
+                print("  Upscale: INT8 weight-only quantization applied (torchao)", flush=True)
+            except Exception as _int8e:
+                print(f"  Upscale: INT8 skipped - {_int8e}", flush=True)
 
         # Inductor GEMM coordinate-descent tuning: profile GEMM kernel configs once,
         # cache the winners — 5-15% on attention/MLP matmuls inside HAT.
