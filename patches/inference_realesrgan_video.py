@@ -463,12 +463,13 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
     torch.backends.cudnn.allow_tf32       = True
 
     # VRAM-adaptive batch: HAT at 1920x1080 tile=0 peaks ~4 GB/frame (feature maps + attention).
-    # 8 GB → 1  |  24 GB → 6  |  32 GB → 8  |  48 GB → 12  |  80 GB → 16
+    # max-autotune-no-cudagraphs pre-allocates ALL intermediate buffers simultaneously.
+    # Use _uvram/8 capped at 4: RTX 3070 8 GB → 1 | RTX 4090 24 GB → 3 | RTX 5090 32 GB → 4
     _uvram = (torch.cuda.get_device_properties(device).total_memory / 1e9
               if device is not None and str(device).startswith('cuda')
               else (torch.cuda.get_device_properties(0).total_memory / 1e9
                     if torch.cuda.is_available() else 0))
-    UPSCALE_BATCH = min(16, max(1, int(_uvram / 4)))
+    UPSCALE_BATCH = min(4, max(1, int(_uvram / 8)))
     print(f"  Upscale: UPSCALE_BATCH={UPSCALE_BATCH} ({_uvram:.0f} GB VRAM detected)", flush=True)
 
     if _ort_inferencer is None:
