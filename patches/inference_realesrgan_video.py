@@ -638,7 +638,7 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
             # This prevents "tensor output overwritten by subsequent run" on replay.
             print(f"  Upscale: pre-warming mask cache ({_target}×{_target})...", flush=True)
             with torch.no_grad():
-                _mwup = torch.rand(1, 3, _target, _target, device=device, dtype=torch.float16)
+                _mwup = torch.rand(1, 3, _target, _target, device=upsampler.device, dtype=torch.float16)
                 _orig_hat(_mwup)  # run ORIGINAL (uncompiled) model to set _mask_cache
                 del _mwup
             del _orig_hat
@@ -653,13 +653,13 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                 print(f"  Upscale: CUDA graph warmup ({_target}x{_target} × B={_TILE_BATCH})...",
                       flush=True)
                 _wup = torch.rand(_TILE_BATCH, 3, _target, _target,
-                                  device=device, dtype=torch.float16)
+                                  device=upsampler.device, dtype=torch.float16)
                 with torch.no_grad():
                     for _ in range(3):
                         _compiled_hat(_wup)
                 if _TILE_BATCH > 1:
                     _wup1 = torch.rand(1, 3, _target, _target,
-                                       device=device, dtype=torch.float16)
+                                       device=upsampler.device, dtype=torch.float16)
                     with torch.no_grad():
                         for _ in range(3):
                             _compiled_hat(_wup1)
