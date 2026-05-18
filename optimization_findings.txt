@@ -1217,16 +1217,32 @@ B-MAX (bench_maxautotune): CRASHED — CUDA graph pool error (CONFIRMED HARMFUL)
   Add to permanent HARMFUL list: max-autotune (with CUDA graphs) = CRASH
 
 ----------------------------------------------------------------
-B-640 (bench_tile640): QUEUED — tile=640, fewer forward passes per frame
+B-640 (bench_tile640): CONFIRMED — tile=640, fewer forward passes per frame
 ----------------------------------------------------------------
 
-  Theory: tile=640 → 3×2=6 tiles/frame (padded to 660×660) vs 12 at tile=512.
-  TILE_BATCH probe at 660×660: expect B=2 (large tile uses more VRAM).
-  Forward passes/frame: tile=640/B=2 → 3 passes vs tile=512/B=3 → 4 passes.
-  Each pass is larger (660×660 vs 544×544 = 1.47x more pixels), but 25% fewer passes.
-  Net compute change: 3/4 × 1.47 = 1.10x MORE compute. Likely SLOWER overall.
-  Quality: IDENTICAL — tile size has no effect on HAT model output quality.
-  RESULT: TBD (may be slower due to increased per-pass compute)
+  RESULT: 5.37 s/frame (vs B1 6.60) = 1.230x faster — NEW BEST
+
+  Config: tile=640, tile_pad=10, max-autotune-no-cudagraphs, FP8 (Blackwell)
+  TILE_BATCH=2 (B=3 OOM'd — 672x672 tiles need ~42 GB, GPU has 31.4 GB)
+  Padded tile size: 660 → 672 (next multiple of 16)
+  Tiles per frame: ceil(1080/640)=2 × ceil(1920/640)=3 = 6 tiles
+  Forward passes/frame: 6/2 = 3 passes (vs B1's 12/3=4 passes)
+  Compute/pass: 2×672² ≈ 903k pixels vs B1's 3×544² ≈ 888k pixels — nearly EQUAL
+  Total compute: 3 passes × 903k = 2709k vs B1's 4 × 888k = 3551k → 0.763x compute!
+  WHY FASTER: Not because larger tiles are more efficient, but because tile=640 gives
+    a magic grid alignment (2×3=6 tiles) that divides evenly by B=2 into 3 passes,
+    while tile=512 gives 12 tiles dividing by B=3 into 4 passes. 25% fewer passes
+    with ~same compute/pass = 23% faster. ZERO quality impact.
+
+  KEY INSIGHT for future tuning:
+    Optimal tile size = one that minimises (num_passes = ceil(tiles/TILE_BATCH))
+    For 1080×1920 content:
+      tile=512 → 12 tiles, B=3 → 4 passes
+      tile=640 → 6 tiles, B=2 → 3 passes  ← OPTIMAL (tile×3 just fits in 31 GB)
+      tile=768 → 6 tiles, B=2 → 3 passes  (but 800x800 > 672x672 → more compute)
+    tile=640 is the sweet spot: fewest passes, least compute per pass.
+
+  Quality: IDENTICAL — tile size and TILE_BATCH do not affect model output quality.
 
 ----------------------------------------------------------------
 B-TRT2 (bench_trt2): QUEUED — TRT FP16, no torchao (FIXED run)
@@ -1249,7 +1265,7 @@ BENCH CHECKLIST (as of Session 7 end)
   B1     bench_autotune   max-autotune-no-cudagraphs, B=3     DONE      6.60     1.000x  ← BEST
   B-TRT  bench_trt        TRT FP16 + FP8 (conflict)          ABORTED   —        —
   B-MAX  bench_maxautotune max-autotune+CUDA graphs, B=2      CRASHED   —        HARMFUL
-  B-640  bench_tile640    tile=640, max-autotune-no-cg        RUNNING   TBD      TBD
+  B-640  bench_tile640    tile=640, max-autotune-no-cg        RUNNING   5.37     1.230x  ← NEW BEST
   B-TRT2 bench_trt2       TRT FP16, no FP8 (FIXED)           QUEUED    TBD      TBD
 
   Active: screen 178731.bench_new2 = (maxautotune DONE) → bench_tile640 → bench_trt2
