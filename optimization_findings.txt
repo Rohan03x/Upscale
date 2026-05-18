@@ -1388,15 +1388,19 @@ BENCH CHECKLIST (as of Session 9)
   B-MAX   bench_maxautotune max-autotune+CUDA graphs, B=2       CRASHED   —        HARMFUL
   B-640   bench_tile640     tile=640, pad=10, max-autotune-no-cg DONE     5.31     1.243x  ← BEST
   B-TRT2  bench_trt2        TRT FP16, no FP8 (FIXED)           FAILED    —        BLOCKED
-  B-PAD8  bench_tile_pad8   tile=640, pad=8, max-autotune-no-cg RUNNING  TBD      TBD
-  B-PAD0  bench_tile_pad0   tile=640, pad=0, max-autotune-no-cg PENDING  TBD      quality?
+  B-PAD8  bench_tile_pad8   tile=640, pad=8, max-autotune-no-cg  RUNNING  5.10*   1.041x*
+  B-PAD0  bench_tile_pad0   tile=640, pad=0, max-autotune-no-cg  PENDING  TBD     quality?
 
-  Active: screen 213282.bench_pad8 = bench_tile_pad8 RUNNING (AUTOTUNE warmup 656×656)
-  Next: bench_tile_pad0 (after pad8 done; pushed to GitHub d41f2e2)
+  * preliminary: frame 9/550, GPU 100%, VRAM 26979 MiB, TILE_BATCH=2 confirmed.
+    Expected to settle ~5.08-5.12 s/frame.
+
+  Active: screen 213282.bench_pad8 = bench_tile_pad8 RUNNING (~46 min remaining)
+  Next: bench_tile_pad0 (deployed to pod at 07f80b0; ready in /root/Upscale/bench_tile_pad0.sh)
 
   Expected results:
-    B-PAD8: ~5.06 s/frame (5.31 × 0.953 = 5.06) — 4.7% faster than B-640
-    B-PAD0: ~4.82 s/frame (5.31 × 0.907 = 4.82) — quality experiment
+    B-PAD8: ~5.10 s/frame (actual prelim, compute ratio 0.960 vs B-640) — 4.0% faster than B-640
+    B-PAD0: ~4.85 s/frame (5.10 × 640²/656² = 5.10 × 0.952 = 4.86) — quality experiment
+             NOTE: pad=0 means zero context overlap between tiles → likely seam artifacts
 
   THEORETICAL MINIMUM (tile=640 pad=0 B=2 = 9.3% less than B-640):
     ~4.82 s/frame with no quality degradation is the floor with current architecture.
