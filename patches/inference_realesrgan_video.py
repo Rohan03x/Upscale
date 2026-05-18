@@ -560,19 +560,22 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         except Exception:
             pass
 
-        # torch.compile(reduce-overhead): CUDA graph capture (NOT Triton synthesis).
-        # With tile inference, every tile call has the SAME fixed shape (_target×_target),
-        # so the graph is captured once on warmup and replayed without Python dispatch
-        # overhead (~hundreds of kernel launches → single cudaGraphLaunch).
-        # reduce-overhead ≠ max-autotune: no Triton; compile = one warmup pass (~30-90 s).
+        # torch.compile: mode controlled by --compile-mode (default: max-autotune-no-cudagraphs).
+        # max-autotune-no-cudagraphs: exhaustive Triton kernel search, no CUDA graphs.
+        #   Longer first warmup (10-30 min, cached); faster per-tile steady state.
+        # reduce-overhead: CUDA graph capture, one warmup pass (~30-90 s).
         # Flash SDPA explicitly enabled; cuDNN SDPA uses native FA3 on Blackwell:
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(False)  # FA2 supersedes this
         torch.backends.cuda.enable_cudnn_sdp(True)           # cuDNN FA3 on sm_120+ (Blackwell)
+        _cmode     = getattr(args, 'compile_mode', 'max-autotune-no-cudagraphs')
+        _fullgraph = getattr(args, 'fullgraph', False)
+        _use_cudagraphs = (_cmode == 'reduce-overhead')
         try:
             _compiled_hat = torch.compile(
-                upsampler.model, mode='reduce-overhead', dynamic=False, fullgraph=False)
-            print("  Upscale: torch.compile(reduce-overhead) — CUDA graphs + FP8", flush=True)
+                upsampler.model, mode=_cmode, dynamic=False, fullgraph=_fullgraph)
+            _cmode_label = 'CUDA graphs' if _use_cudagraphs else 'Triton kernel search'
+            print(f"  Upscale: torch.compile({_cmode}, fullgraph={_fullgraph}) — {_cmode_label}", flush=True)
         except Exception as _ce:
             _compiled_hat = upsampler.model
             print(f"  Upscale: torch.compile failed ({_ce}), using eager", flush=True)
@@ -717,7 +720,6 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                     try:
                         _probe3 = torch.rand(3, 3, _target, _target,
                                              device=upsampler.device, dtype=torch.float16)
-                        torch.compiler.cudagraph_mark_step_begin()
                         with torch.no_grad():
                             _compiled_hat(_probe3)
                         del _probe3
@@ -729,7 +731,24 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                     except (torch.cuda.OutOfMemoryError, RuntimeError):
                         torch.cuda.empty_cache()
                         print("  Upscale: TILE_BATCH=3 probe OOM — staying at 2", flush=True)
-                print(f"  Upscale: CUDA graph warmup ({_target}x{_target} × B={_TILE_BATCH})...",
+                # TILE_BATCH=4 probe: ~1.5 GB headroom on RTX 5090 at B=3 (29.9/31.4 GB).
+                if _TILE_BATCH == 3:
+                    try:
+                        _probe4 = torch.rand(4, 3, _target, _target,
+                                             device=upsampler.device, dtype=torch.float16)
+                        with torch.no_grad():
+                            _compiled_hat(_probe4)
+                        del _probe4
+                        torch.cuda.empty_cache()
+                        _TILE_BATCH = 4
+                        _patch_tile_process(_compiled_hat)
+                        print("  Upscale: TILE_BATCH=4 probe succeeded — bumped from 3",
+                              flush=True)
+                    except (torch.cuda.OutOfMemoryError, RuntimeError):
+                        torch.cuda.empty_cache()
+                        print("  Upscale: TILE_BATCH=4 probe OOM — staying at 3", flush=True)
+                _warmup_label = 'CUDA graph' if _use_cudagraphs else 'compile'
+                print(f"  Upscale: {_warmup_label} warmup ({_target}x{_target} × B={_TILE_BATCH})...",
                       flush=True)
                 _wup = torch.rand(_TILE_BATCH, 3, _target, _target,
                                   device=upsampler.device, dtype=torch.float16)
@@ -745,7 +764,8 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                     del _wup1
                 torch.cuda.synchronize()
                 del _wup
-                print("  Upscale: warmup complete — CUDA graphs active", flush=True)
+                _warmup_done_label = 'CUDA graphs active' if _use_cudagraphs else 'Triton kernels ready'
+                print(f"  Upscale: warmup complete — {_warmup_done_label}", flush=True)
             except Exception as _we:
                 print(f"  Upscale: compile/warmup failed ({type(_we).__name__}: {_we}); "
                       f"reverting to eager FP8", flush=True)
@@ -862,6 +882,12 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                     _, _, output = face_enhancer.enhance(
                         img, has_aligned=False, only_center_face=False, paste_back=True)
                 else:
+                    _pre_ds = getattr(args, 'pre_downscale', 1.0)
+                    if _pre_ds != 1.0:
+                        _ph, _pw = img.shape[:2]
+                        import cv2 as _cv2_ds
+                        img = _cv2_ds.resize(img, (int(_pw / _pre_ds), int(_ph / _pre_ds)),
+                                             interpolation=_cv2_ds.INTER_AREA)
                     output, _ = upsampler.enhance(img, outscale=args.outscale)
             except RuntimeError as error:
                 print('Error', error)
@@ -891,6 +917,12 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                 _cg = None  # invalidate graph on error
                 for f in _buf:
                     try:
+                        _pre_ds2 = getattr(args, 'pre_downscale', 1.0)
+                        if _pre_ds2 != 1.0:
+                            _fh, _fw = f.shape[:2]
+                            import cv2 as _cv2_ds2
+                            f = _cv2_ds2.resize(f, (int(_fw / _pre_ds2), int(_fh / _pre_ds2)),
+                                                interpolation=_cv2_ds2.INTER_AREA)
                         o, _ = upsampler.enhance(f, outscale=args.outscale)
                         writer.write_frame(o)
                     except Exception as e2:
@@ -979,6 +1011,14 @@ def main():
     parser.add_argument('--suffix', type=str, default='out', help='Suffix of the restored video')
     parser.add_argument('-t', '--tile', type=int, default=0, help='Tile size, 0 for no tile during testing')
     parser.add_argument('--tile_pad', type=int, default=10, help='Tile padding')
+    parser.add_argument('--compile-mode', dest='compile_mode', type=str,
+        default='max-autotune-no-cudagraphs',
+        choices=['reduce-overhead', 'max-autotune-no-cudagraphs', 'max-autotune', 'default', 'eager'],
+        help='torch.compile mode. max-autotune-no-cudagraphs: full Triton search (slower first run, faster steady state). reduce-overhead: CUDA graph capture.')
+    parser.add_argument('--fullgraph', action='store_true', default=False,
+        help='torch.compile fullgraph=True — forces no Python graph breaks. May error if HAT has control flow.')
+    parser.add_argument('--pre-downscale', dest='pre_downscale', type=float, default=1.0,
+        help='Downscale input frames by this factor before HAT (e.g. 1.5 = 1080p→720p, ~2x faster, slight quality tradeoff).')
     parser.add_argument('--pre_pad', type=int, default=0, help='Pre padding size at each border')
     parser.add_argument('--face_enhance', action='store_true', help='Use GFPGAN to enhance face')
     parser.add_argument(
