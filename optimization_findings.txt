@@ -1202,18 +1202,19 @@ NEW: bench_trt2.sh — clean TRT FP16 (no torchao quant, full TRT compile expect
   Expected: Full model compiled by TRT, genuine FP16 engine speedup.
 
 ----------------------------------------------------------------
-B-MAX (bench_maxautotune): RUNNING — max-autotune WITH CUDA graphs
+B-MAX (bench_maxautotune): CRASHED — CUDA graph pool error (CONFIRMED HARMFUL)
 ----------------------------------------------------------------
 
   Config: max-autotune (Triton kernel search + CUDA graphs), B=2, FP8, tile=512
-  TILE_BATCH=2 (CUDA graph capture consumes more VRAM than max-autotune-no-cudagraphs)
-  NOTE: B=3 with max-autotune (no-cg) gave 6.60. B=2 here = 6 passes/frame vs 4.
-    CUDA graphs need to be significantly faster per pass to compensate.
-  STATUS: Warmup in progress (max-autotune + FP8 + CUDA graphs, may take 10-30 min).
-  RISK: RTX 3070 crashed with _mask_cache pool error under max-autotune CUDA graphs.
-    RTX 5090 uses _PaddedTileModel (static shapes pre-fixed). Mask is pre-warmed.
-    May work on 5090 where it couldn't on 3070.
-  RESULT: TBD
+  RESULT: CRASHED at frame 0/550. AssertionError → Broken pipe on muxer.
+  ROOT CAUSE: Same as RTX 3070 (Session 4 Finding #13 BUG 1):
+    max-autotune forces triton.cudagraphs=True internally.
+    _mask_cache_size != x_size guard allocates tensor OUTSIDE the CUDA graph scope.
+    CUDA graph replay sees foreign storage → pool assertion fails.
+    Even though _PaddedTileModel ensures static shapes, the _mask_cache
+    tensor was allocated before the compile call and lives outside the graph pool.
+  CONFIRMED HARMFUL ON BOTH RTX 3070 AND RTX 5090.
+  Add to permanent HARMFUL list: max-autotune (with CUDA graphs) = CRASH
 
 ----------------------------------------------------------------
 B-640 (bench_tile640): QUEUED — tile=640, fewer forward passes per frame
@@ -1247,13 +1248,14 @@ BENCH CHECKLIST (as of Session 7 end)
   B0     baseline         reduce-overhead, B=3, FP8           DONE      6.97     0.946x
   B1     bench_autotune   max-autotune-no-cudagraphs, B=3     DONE      6.60     1.000x  ← BEST
   B-TRT  bench_trt        TRT FP16 + FP8 (conflict)          ABORTED   —        —
-  B-MAX  bench_maxautotune max-autotune+CUDA graphs, B=2      RUNNING   TBD      TBD
-  B-640  bench_tile640    tile=640, max-autotune-no-cg        QUEUED    TBD      TBD
+  B-MAX  bench_maxautotune max-autotune+CUDA graphs, B=2      CRASHED   —        HARMFUL
+  B-640  bench_tile640    tile=640, max-autotune-no-cg        RUNNING   TBD      TBD
   B-TRT2 bench_trt2       TRT FP16, no FP8 (FIXED)           QUEUED    TBD      TBD
 
-  Active: screen 178731.bench_new2 = bench_maxautotune → bench_tile640 → bench_trt2
+  Active: screen 178731.bench_new2 = (maxautotune DONE) → bench_tile640 → bench_trt2
   HARMFUL (never retry again):
     channels_last: CRASH (CUDA graph pool error)
+    max-autotune (with CUDA graphs): CRASH — _mask_cache pool error (confirmed RTX 3070 + 5090)
     frame-level batch>1 (tile=0): 0.38x catastrophic
     BF16: 0.97x, cudnn.benchmark: 0.88x
     TRT + torchao FP8/INT8: TRT compile fails (mul_16 not lowerable to TRT kernel)
